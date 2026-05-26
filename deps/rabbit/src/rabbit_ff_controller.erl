@@ -920,8 +920,14 @@ sync_cluster_task(Nodes) ->
                            Inventory),
             case CantEnable of
                 [] ->
-                    FeatureNames = list_feature_flags_enabled_somewhere(
-                                     Inventory, false),
+                    %% Some deprecated features alreay denied in the cluster
+                    %% could be permitted again through configuration. If
+                    %% that's the case, we need to disable their underlying
+                    %% feature flag.
+                    disable_permitted_deprecated_features(Inventory),
+
+                    FeatureNames = (
+                      list_feature_flags_enabled_somewhere(Inventory, false)),
 
                     %% In addition to feature flags enabled somewhere, we also
                     %% ensure required feature flags are enabled accross the
@@ -942,6 +948,11 @@ sync_cluster_task(Nodes) ->
                     FeatureNamesToEnable = lists:usort(
                                              FeatureNames ++
                                              RequiredFeatureNames),
+                    ?LOG_DEBUG(
+                       "Feature flags: feature flags/deprecated features that "
+                       "need to be enabled somewhere: ~0p",
+                       [FeatureNamesToEnable],
+                       #{domain => ?RMQLOG_DOMAIN_FEAT_FLAGS}),
                     enable_many(Inventory, FeatureNamesToEnable);
                 _ ->
                     ?LOG_ERROR(
@@ -982,6 +993,8 @@ refresh_after_app_load_task() ->
       Ret :: ok | {error, Reason},
       Reason :: term().
 
+enable_many(#{states_per_node := _}, []) ->
+    ok;
 enable_many(#{states_per_node := _} = Inventory, FeatureNames) ->
     %% We acquire a lock before making any change to the registry. This is not
     %% used by the controller (because it is already using a globally
@@ -1490,19 +1503,38 @@ merge_feature_flags(FeatureFlagsA, FeatureFlagsB) ->
 list_feature_flags_enabled_somewhere(
   #{states_per_node := StatesPerNode},
   HandleStateChanging) ->
-    %% We want to collect feature flags which are enabled on at least one
-    %% node.
+    %% We want to collect feature flags which are enabled on at least one node.
+    %% We exclude feature flags that are already enabled everywhere.
+    NodeCount = maps:size(StatesPerNode),
     MergedStates = maps:fold(
                      fun(_Node, FeatureStates, Acc1) ->
                              maps:fold(
                                fun
                                    (FeatureName, true, Acc2) ->
-                                       Acc2#{FeatureName => true};
+                                       Count = maps:get(FeatureName, Acc2, 0),
+                                       case Count + 1 of
+                                           NodeCount ->
+                                               %% This feature flag is already
+                                               %% enabled everywhere, remove it
+                                               %% from the list.
+                                               maps:remove(FeatureName, Acc2);
+                                           NewCount ->
+                                               Acc2#{FeatureName => NewCount}
+                                       end;
                                    (_FeatureName, false, Acc2) ->
                                        Acc2;
                                    (FeatureName, state_changing, Acc2)
                                      when HandleStateChanging ->
-                                       Acc2#{FeatureName => true}
+                                       Count = maps:get(FeatureName, Acc2, 0),
+                                       case Count + 1 of
+                                           NodeCount ->
+                                               %% This feature flag is already
+                                               %% enabled everywhere, remove it
+                                               %% from the list.
+                                               maps:remove(FeatureName, Acc2);
+                                           NewCount ->
+                                               Acc2#{FeatureName => NewCount}
+                                       end
                                end, Acc1, FeatureStates)
                      end, #{}, StatesPerNode),
     lists:sort(maps:keys(MergedStates)).
@@ -1561,6 +1593,32 @@ list_deprecated_features_that_cant_be_denied(
           (_FeatureName, false, Acc) ->
               Acc
       end, [], States).
+
+-spec disable_permitted_deprecated_features(Inventory) -> ok when
+      Inventory :: rabbit_feature_flags:cluster_inventory().
+
+disable_permitted_deprecated_features(
+  #{states_per_node := StatesPerNode} = Inventory) ->
+    PermittedDeprecatedNames = (
+      rabbit_deprecated_features:list_denied_but_should_be_permitted(
+        Inventory)),
+    case PermittedDeprecatedNames of
+        [] ->
+            ok;
+        _ ->
+            %% Some deprecated features go from denied to permitted again,
+            %% thanks to a configuration setting. We need to marke them as
+            %% disabled everywhere. This is the only case where a feature flag
+            %% can go from "enabled" to "disabled".
+            Nodes = maps:keys(StatesPerNode),
+            lists:foreach(
+              fun(PermittedDeprecatedName) ->
+                      _ = mark_as_enabled_on_nodes(
+                            Nodes, Inventory, PermittedDeprecatedName,
+                            false)
+              end, PermittedDeprecatedNames),
+            ok
+    end.
 
 -spec list_nodes_who_know_the_feature_flag(Inventory, FeatureName) ->
     Ret when
