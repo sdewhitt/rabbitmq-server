@@ -16,6 +16,8 @@
 -export([start_link/0, check/1, reset/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
+-define(SWEEP_INTERVAL_MS, 120000).
+
 -record(state, {window_ms       :: pos_integer(),
                 max_per_window  :: pos_integer(),
                 buckets         :: #{Source :: term() => {Count :: non_neg_integer(),
@@ -37,6 +39,7 @@ reset() ->
 init([]) ->
     Window = application:get_env(rabbitmq_auth_validation, rate_limit_window_ms, 60000),
     Max    = application:get_env(rabbitmq_auth_validation, rate_limit_max_requests, 10),
+    schedule_sweep(),
     {ok, #state{window_ms = Window, max_per_window = Max, buckets = #{}}}.
 
 handle_call({check, Source}, _From, #state{window_ms = W,
@@ -61,5 +64,15 @@ handle_call({check, Source}, _From, #state{window_ms = W,
 handle_cast(reset, State) ->
     {noreply, State#state{buckets = #{}}}.
 
+handle_info(sweep, #state{window_ms = W, buckets = B} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    Swept = maps:filter(fun(_Source, {_Count, WindowStart}) ->
+        Now - WindowStart < W
+    end, B),
+    schedule_sweep(),
+    {noreply, State#state{buckets = Swept}};
 handle_info(_Msg, State) ->
     {noreply, State}.
+
+schedule_sweep() ->
+    erlang:send_after(?SWEEP_INTERVAL_MS, self(), sweep).

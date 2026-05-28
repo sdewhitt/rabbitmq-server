@@ -167,16 +167,17 @@ ca_opts(M) ->
     case CaPems of
         undefined -> Base1;
         Pems when is_list(Pems) ->
-            DerEncoded = lists:map(fun decode_pem/1, Pems),
+            DerEncoded = lists:flatmap(fun decode_pem/1, Pems),
             [{cacerts, DerEncoded} | Base1];
         _ -> throw({input_invalid, "ssl_options.cacert_pem_data must be a list of PEM strings"})
     end.
 
 decode_pem(P) when is_binary(P) ->
     try public_key:pem_decode(P) of
-        [{'Certificate', Der, not_encrypted}] -> Der;
-        [] -> throw({input_invalid, "ssl_options.cacert_pem_data: no certificates found"});
-        _  -> throw({input_invalid, "ssl_options.cacert_pem_data: unexpected PEM contents"})
+        [] ->
+            throw({input_invalid, "ssl_options.cacert_pem_data: no certificates found"});
+        Entries ->
+            [Der || {'Certificate', Der, not_encrypted} <- Entries]
     catch
         error:_ -> throw({input_invalid, "ssl_options.cacert_pem_data: invalid PEM"})
     end;
@@ -274,7 +275,7 @@ bind(Conn, false, _TlsOpts, UserDN, Password, _Timeout) ->
     simple_bind(Conn, UserDN, Password).
 
 simple_bind(Conn, UserDN, Password) ->
-    case eldap:simple_bind(Conn, binary_to_list(UserDN), Password) of
+    case eldap:simple_bind(Conn, binary_to_list(UserDN), binary_to_list(Password)) of
         ok ->
             ok;
         {error, invalidCredentials} ->

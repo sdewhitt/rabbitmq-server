@@ -1,0 +1,75 @@
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+%% ----------------------------------------------------------------------------
+%% RabbitMQ Auth Validation Plugin
+%%
+%% Provides an HTTP endpoint for validating auth backend configurations
+%% without mutating broker state.
+%% ----------------------------------------------------------------------------
+
+%% Which validation methods are enabled. Only methods listed here are
+%% routable; all others return 404.
+%%
+%% auth_validation.enabled_methods.1 = ldap-simple-bind
+
+{mapping, "auth_validation.enabled_methods.$name", "rabbitmq_auth_validation.enabled_methods",
+    [{datatype, string}]}.
+
+{translation, "rabbitmq_auth_validation.enabled_methods",
+fun(Conf) ->
+    Settings = cuttlefish_variable:filter_by_prefix("auth_validation.enabled_methods", Conf),
+    [list_to_binary(V) || {_, V} <- Settings]
+end}.
+
+%% Maximum request body size in bytes. Requests exceeding this are
+%% rejected before parsing.
+%%
+%% auth_validation.max_body_size = 65536
+
+{mapping, "auth_validation.max_body_size", "rabbitmq_auth_validation.max_body_size",
+    [{datatype, integer}, {default, 65536}, {validators, ["non_negative_integer"]}]}.
+
+%% Maximum number of concurrent outbound validation connections.
+%% When capacity is exhausted, requests receive 503.
+%%
+%% auth_validation.max_concurrent = 5
+
+{mapping, "auth_validation.max_concurrent", "rabbitmq_auth_validation.max_concurrent",
+    [{datatype, integer}, {default, 5}, {validators, ["non_negative_integer"]}]}.
+
+%% Connection timeout for outbound validation attempts in milliseconds.
+%%
+%% auth_validation.connection_timeout_ms = 5000
+
+{mapping, "auth_validation.connection_timeout_ms", "rabbitmq_auth_validation.connection_timeout_ms",
+    [{datatype, integer}, {default, 5000}, {validators, ["non_negative_integer"]}]}.
+
+%% Rate limiting window in milliseconds. Within each window, a source IP
+%% may issue at most rate_limit.max_requests validation requests.
+%%
+%% auth_validation.rate_limit.window_seconds = 60
+
+{mapping, "auth_validation.rate_limit.window_seconds", "rabbitmq_auth_validation.rate_limit_window_ms",
+    [{datatype, integer}, {default, 60}]}.
+
+{translation, "rabbitmq_auth_validation.rate_limit_window_ms",
+fun(Conf) ->
+    cuttlefish:conf_get("auth_validation.rate_limit.window_seconds", Conf) * 1000
+end}.
+
+%% Maximum number of validation requests per source IP within the rate
+%% limiting window.
+%%
+%% auth_validation.rate_limit.max_requests = 10
+
+{mapping, "auth_validation.rate_limit.max_requests", "rabbitmq_auth_validation.rate_limit_max_requests",
+    [{datatype, integer}, {default, 10}, {validators, ["non_negative_integer"]}]}.
+
+%% Required user tag to access the validation endpoint.
+%% Accepted values: administrator, management, monitoring, policymaker
+%%
+%% auth_validation.required_user_tag = administrator
+
+{mapping, "auth_validation.required_user_tag", "rabbitmq_auth_validation.required_user_tag",
+    [{datatype, {enum, [administrator, management, monitoring, policymaker]}},
+     {default, administrator}]}.

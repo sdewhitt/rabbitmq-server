@@ -198,17 +198,10 @@ source_ip(Req) ->
     end.
 
 audit(Backend, Source, Result, DurationMs) ->
-    %% Audit logging deliberately includes only the method name, source
-    %% address, result category and duration. Server addresses, DNs and
-    %% credentials never appear in audit output.
-    Method = try Backend:method_name() catch _:_ -> unknown end,
-    ?LOG_INFO(#{
-        domain         => [rabbitmq, auth_validation],
-        method         => Method,
-        source         => format_source(Source),
-        result         => Result,
-        duration_ms    => DurationMs
-    }).
+    Method = try Backend:method_name() catch _:_ -> <<"unknown">> end,
+    ?LOG_INFO("auth_validation: method=~s source=~s result=~p duration_ms=~B",
+              [Method, format_source(Source), Result, DurationMs],
+              #{domain => [rabbitmq, auth_validation]}).
 
 format_source({_, _, _, _} = IPv4) ->
     list_to_binary(inet:ntoa(IPv4));

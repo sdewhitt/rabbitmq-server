@@ -1,0 +1,6 @@
+ebin/
+sbin/
+escript/
+plugins/
+*.d
+logs/
