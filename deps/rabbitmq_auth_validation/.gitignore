@@ -3,4 +3,5 @@ sbin/
 escript/
 plugins/
 *.d
+*.beam
 logs/
