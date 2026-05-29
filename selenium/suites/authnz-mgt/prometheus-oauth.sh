@@ -2,9 +2,9 @@
 
 SCRIPT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-TEST_CASES_PATH=/oauth/with-sp-initiated
+TEST_CASES_PATH=/prometheus
 TEST_CONFIG_PATH=/oauth
-PROFILES="keycloak keycloak-verify-none-oauth-provider keycloak-mgt-oauth-provider tls one-minute-session-timeout"
+PROFILES="keycloak keycloak-oauth-provider prometheus-oauth"
 
 source $SCRIPT/../../bin/suite_template $@
 runWith keycloak
