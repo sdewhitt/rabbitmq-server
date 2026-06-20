@@ -79,6 +79,7 @@
 -export([raw_read_file/1]).
 -export([strip_bom/1]).
 -export([find_child/2]).
+-export([shutdown_supervisor/1]).
 -export([is_regular_file/1]).
 -export([safe_ets_update_counter/3, safe_ets_update_counter/4, safe_ets_update_counter/5,
          safe_ets_update_element/3, safe_ets_update_element/4, safe_ets_update_element/5]).
@@ -988,7 +989,7 @@ os_cmd(Command) ->
             os:cmd(" " ++ Command);
         _ ->
             %% Don't just return "/bin/sh: <cmd>: not found" if not found
-            Exec = hd(string:tokens(Command, " ")),
+            Exec = hd(string:lexemes(Command, " ")),
             case os:find_executable(Exec) of
                 false -> throw({command_not_found, Exec});
                 _     -> os:cmd(Command)
@@ -1055,11 +1056,9 @@ otp_release() ->
                           erlang:system_info(otp_release), "OTP_VERSION"]),
     case raw_read_file(File) of
         {ok, VerBin} ->
-            %% 17.0 or later, we need the file for the minor version
-            string:strip(binary_to_list(VerBin), both, $\n);
+            string:trim(binary_to_list(VerBin), both, "\n");
         {error, _} ->
-            %% R16B03 or earlier (no file, otp_release is correct)
-            %% or we couldn't read the file (so this is best we can do)
+            %% The file could not be read; fall back to the major-only string.
             erlang:system_info(otp_release)
     end.
 
@@ -1067,7 +1066,7 @@ platform_and_version() ->
     string:join(["Erlang/OTP", otp_release()], " ").
 
 otp_system_version() ->
-    string:strip(erlang:system_info(system_version), both, $\n).
+    string:trim(erlang:system_info(system_version), both, "\n").
 
 crypto_lib_version() ->
     rabbit_runtime:crypto_lib_version().
@@ -1162,7 +1161,6 @@ get_proc_name() ->
             {ok, Name}
     end.
 
-%% application:get_env/3 is available in R16B01 or later.
 get_env(Application, Key, Def) ->
     application:get_env(Application, Key, Def).
 
@@ -1434,6 +1432,22 @@ safe_ets_update_element(Tab, Key, ElementSpec, OnSuccess, OnFailure) ->
 find_child(Supervisor, Name) ->
     [Pid || {Name1, Pid, _Type, _Modules} <- supervisor:which_children(Supervisor),
             Name1 =:= Name].
+
+%% Must be called by the process that holds the link to SupPid.
+-spec shutdown_supervisor(pid()) -> ok.
+shutdown_supervisor(SupPid) when is_pid(SupPid) ->
+    MRef = erlang:monitor(process, SupPid),
+    unlink(SupPid),
+    exit(SupPid, shutdown),
+    receive
+        {'DOWN', MRef, process, SupPid, _} -> ok
+    after ?FAIR_WAIT ->
+        erlang:demonitor(MRef, [flush]),
+        ?LOG_WARNING(
+            "rabbit_misc:shutdown_supervisor/1 timed out waiting for ~tp to terminate",
+            [SupPid]),
+        ok
+    end.
 
 %% -------------------------------------------------------------------------
 %% Begin copypasta from gen_server2.erl

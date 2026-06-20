@@ -16,7 +16,7 @@
 
 -module(rabbit_stream_utils).
 
--feature(maybe_expr, enable).
+-define(MAX_SUPER_STREAM_PARTITIONS, 1000).
 
 %% API
 -export([enforce_correct_name/1,
@@ -35,8 +35,20 @@
          filter_spec/1,
          command_versions/0,
          check_super_stream_management_permitted/4,
+         check_super_stream_permitted/3,
          offset_lag/4,
-         consumer_offset/3]).
+         consumer_offset/3,
+         validate_super_stream_max_partitions/1,
+         max_super_stream_partitions/0]).
+
+%% super stream partition helpers
+-export([streams_from_partitions/2,
+         streams_from_binding_keys/2,
+         binding_keys/1,
+         routing_keys/1]).
+
+%% for tests
+-export([validate_super_stream_max_partitions/2]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbitmq_stream_common/include/rabbit_stream.hrl").
@@ -194,13 +206,14 @@ check_write_permitted(Resource, User) ->
 check_read_permitted(Resource, User, Context) ->
     check_resource_access(User, Resource, read, Context).
 
--spec check_super_stream_management_permitted(rabbit_types:vhost(), binary(), [binary()], rabbit_types:user()) ->
+-spec check_super_stream_management_permitted(rabbit_types:vhost(), binary(),
+                                              [binary()], rabbit_types:user()) ->
     ok | error.
 check_super_stream_management_permitted(VirtualHost, SuperStream, Partitions, User) ->
     Exchange = e(VirtualHost, SuperStream),
     maybe
         %% exchange creation
-        ok ?= check_configure_permitted(Exchange, User),
+        ok ?= check_super_stream_permitted(VirtualHost, SuperStream, User),
         %% stream creations
         ok ?= check_streams_permissions(fun check_configure_permitted/2,
                                         VirtualHost, Partitions,
@@ -212,6 +225,13 @@ check_super_stream_management_permitted(VirtualHost, SuperStream, Partitions, Us
                                   VirtualHost, Partitions,
                                   User)
     end.
+
+-spec check_super_stream_permitted(rabbit_types:vhost(), binary(),
+                                   rabbit_types:user()) ->
+    ok | error.
+check_super_stream_permitted(Vhost, SuperStream, User) ->
+    Exchange = e(Vhost, SuperStream),
+    check_configure_permitted(Exchange, User).
 
 check_streams_permissions(Fun, VirtualHost, List, User) ->
     case lists:all(fun(S) ->
@@ -348,3 +368,45 @@ offset_lag(_, 0, 0, LastListenerOffset) when LastListenerOffset > 0 ->
     0;
 offset_lag(CommittedOffset, ConsumerOffset, _, _) ->
     CommittedOffset - ConsumerOffset.
+
+-spec validate_super_stream_max_partitions(list() | integer()) -> boolean().
+validate_super_stream_max_partitions(Partitions) ->
+    MaxPartitions = rabbit_stream_utils:max_super_stream_partitions(),
+    validate_super_stream_max_partitions(Partitions, MaxPartitions).
+
+-spec validate_super_stream_max_partitions(list() | integer(),
+                                           infinity | non_neg_integer()) -> boolean().
+validate_super_stream_max_partitions(_, infinity) ->
+    true;
+validate_super_stream_max_partitions(Partitions, Max) when is_list(Partitions) ->
+    length(Partitions) =< Max;
+validate_super_stream_max_partitions(Partitions, Max) when is_integer(Partitions) ->
+    Partitions =< Max.
+
+-spec max_super_stream_partitions() -> infinity | non_neg_integer().
+max_super_stream_partitions() ->
+    application:get_env(rabbitmq_stream, max_super_stream_partitions,
+                        ?MAX_SUPER_STREAM_PARTITIONS).
+
+%% super stream partition helpers
+-spec streams_from_partitions(binary(), non_neg_integer()) -> [binary()].
+streams_from_partitions(Name, Partitions) ->
+    [<<Name/binary, "-", (integer_to_binary(K))/binary>> ||
+     K <- lists:seq(0, Partitions - 1)].
+
+-spec streams_from_binding_keys(binary(), [binary()]) -> [binary()].
+streams_from_binding_keys(Name, BindingKeys) ->
+    [<<Name/binary, "-", K/binary>> || K <- BindingKeys].
+
+-spec routing_keys(non_neg_integer()) -> [binary()].
+routing_keys(Partitions) ->
+    [integer_to_binary(K) || K <- lists:seq(0, Partitions - 1)].
+
+-spec binding_keys(unicode:chardata()) -> [binary()].
+binding_keys(BindingKeysBin) ->
+    Keys = binary:split(rabbit_data_coercion:to_binary(BindingKeysBin),
+                        <<",">>, [global]),
+    %% Trim first, then verify the token is not an empty binary
+    [Trimmed || K <- Keys,
+                Trimmed <- [string:trim(K)],
+                Trimmed =/= <<>>].

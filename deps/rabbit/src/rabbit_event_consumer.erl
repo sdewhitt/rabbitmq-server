@@ -47,7 +47,7 @@ handle_event(#event{type      = Type,
                                               pattern = Pattern} = State) ->
     _ = case key(Type) of
         ignore -> ok;
-        Key    -> case re:run(Key, Pattern, [{capture, none}]) of
+        Key    -> case rabbit_re:run(Key, Pattern) of
                       match ->
                           Data = [{'event', Key}] ++
                               fmt_proplist([{'timestamp_in_ms', TS} | Props]),
@@ -156,7 +156,7 @@ key(federation_link_status) ->
 key(federation_link_removed) ->
     <<"federation.link.removed">>;
 key(S) ->
-    case string:tokens(atom_to_list(S), "_") of
+    case string:lexemes(atom_to_list(S), "_") of
         [_, "stats"] -> ignore;
         Tokens       -> list_to_binary(string:join(Tokens, "."))
     end.

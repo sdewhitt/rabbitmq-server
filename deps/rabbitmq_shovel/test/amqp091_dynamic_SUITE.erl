@@ -450,7 +450,15 @@ credit_flow(Config) ->
                             Cnt =:= 0
                     end,
                     5000),
-                  #{messages := 1000} = message_count(Config, <<"dest">>),
+                  %% With on-publish ack mode the shovel acks in src when it publishes
+                  %% to dest (no confirms), so src reaching 0 does not guarantee that
+                  %% dest has already received all messages from the broker's perspective.
+                  rabbit_ct_helpers:await_condition(
+                    fun() ->
+                            #{messages := Cnt} = message_count(Config, <<"dest">>),
+                            Cnt =:= 1000
+                    end,
+                    5000),
                   [{_, P, _}] =
                       rabbit_ct_broker_helpers:rpc(
                         Config, 0, recon, proc_count, [message_queue_len, 1]),
@@ -520,7 +528,9 @@ spawn_suspender_proc(Pid) ->
         spawn(
           fun() ->
                   register(suspender, self()),
-                  Res = catch (true = erlang:suspend_process(Pid)),
+                  Res = try true = erlang:suspend_process(Pid)
+                          catch _:E -> E
+                          end,
                   ReqPid ! {suspend_res, self(), Res},
                   %% wait indefinitely
                   receive stop -> ok end
@@ -535,7 +545,10 @@ find_shovel_pid(Config) ->
     [ShovelPid] = [P || P <- rabbit_ct_broker_helpers:rpc(
                                Config, 0, erlang, processes, []),
                         rabbit_shovel_worker ==
-                            (catch element(1, erpc:call(node(P), proc_lib, initial_call, [P])))],
+                            (try element(1, erpc:call(
+                                               node(P), proc_lib, initial_call, [P]))
+                             catch _:_ -> undefined
+                             end)],
     ShovelPid.
 
 get_shovel_state(ShovelPid) ->

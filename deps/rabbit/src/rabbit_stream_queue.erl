@@ -6,7 +6,6 @@
 %%
 
 -module(rabbit_stream_queue).
--feature(maybe_expr, enable).
 
 -include("mc.hrl").
 
@@ -1215,7 +1214,7 @@ matches_strategy(even, Members) ->
     length(Members) rem 2 == 0.
 
 is_match(Subj, E) ->
-    nomatch /= re:run(Subj, E).
+    rabbit_re:matches(Subj, E).
 
 get_resource_name(#resource{name = Name}) ->
     Name.

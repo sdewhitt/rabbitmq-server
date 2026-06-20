@@ -29,7 +29,8 @@
 ]).
 
 -export([set_user_limits/3, clear_user_limits/3, is_over_connection_limit/1,
-         is_over_channel_limit/1, get_user_limits/0, get_user_limits/1]).
+         is_over_channel_limit/1, get_user_limit/2,
+         get_user_limits/0, get_user_limits/1]).
 
 -export([user_info_keys/0, perms_info_keys/0,
          user_perms_info_keys/0, vhost_perms_info_keys/0,
@@ -136,8 +137,25 @@ internal_check_user_login(Username, Fun) ->
                 _    -> Refused
             end;
         {error, not_found} ->
+            %% Equalise timing regardless of whether the username exists to
+            %% prevent username enumeration via a timing side-channel.
+            %% The result is always discarded.
+            _ = Fun(dummy_sentinel_user()),
             Refused
     end.
+
+%% A sentinel internal_user whose password hash will never match any real
+%% cleartext. Used solely to perform a dummy hash computation on the
+%% not-found path, equalising timing with the found-but-wrong-password path.
+%% Layout: 4 bytes zeroed salt + 32 bytes zeroed SHA-256 payload.
+-define(DUMMY_PASSWORD_HASH, <<0:32, 0:256>>).
+
+dummy_sentinel_user() ->
+    HashingMod = rabbit_password:hashing_mod(),
+    internal_user:set_password_hash(
+        internal_user:new({hashing_algorithm, HashingMod}),
+        ?DUMMY_PASSWORD_HASH,
+        HashingMod).
 
 check_vhost_access(#auth_user{username = Username}, VHostPath, _AuthzData) ->
     rabbit_db_user:get_user_permissions(Username, VHostPath) =/= undefined.
@@ -155,9 +173,11 @@ check_resource_access(#auth_user{username = Username},
                              <<"">> -> <<$^, $$>>;
                              RE     -> RE
                          end,
-            case re:run(Name, PermRegexp, [{capture, none}]) of
-                match    -> true;
-                nomatch  -> false
+            case rabbit_re:run(Name, PermRegexp) of
+                match   -> true;
+                nomatch -> false;
+                %% Deny on regex error.
+                _Error  -> false
             end
     end.
 
@@ -180,9 +200,11 @@ check_topic_access(#auth_user{username = Username},
                 PermRegexp,
                 maps:get(variable_map, Context, undefined)
             ),
-            case re:run(maps:get(routing_key, Context), PermRegexpExpanded, [{capture, none}]) of
-                match    -> true;
-                nomatch  -> false
+            case rabbit_re:run(maps:get(routing_key, Context),
+                               PermRegexpExpanded) of
+                match   -> true;
+                nomatch -> false;
+                _Error  -> false
             end
     end.
 
@@ -497,7 +519,7 @@ set_permissions(Username, VirtualHost, ConfigurePerm, WritePerm, ReadPerm, Actin
     _ = lists:map(
       fun (RegexpBin) ->
               Regexp = binary_to_list(RegexpBin),
-              case re:compile(Regexp) of
+              case rabbit_re:compile(Regexp) of
                   {ok, _}         -> ok;
                   {error, Reason} ->
                       ?LOG_WARNING("Failed to set permissions for user '~ts' in virtual host '~ts': "
@@ -605,7 +627,7 @@ set_topic_permissions(Username, VirtualHost, Exchange, WritePerm, ReadPerm, Acti
     ReadPermRegex = rabbit_data_coercion:to_binary(ReadPerm),
     lists:foreach(
       fun (RegexpBin) ->
-              case re:compile(RegexpBin) of
+              case rabbit_re:compile(RegexpBin) of
                   {ok, _}         -> ok;
                   {error, Reason} ->
                       ?LOG_WARNING("Failed to set topic permissions on exchange '~ts' for user "
@@ -614,6 +636,31 @@ set_topic_permissions(Username, VirtualHost, Exchange, WritePerm, ReadPerm, Acti
                       throw({error, {invalid_regexp, RegexpBin, Reason}})
               end
       end, [WritePerm, ReadPerm]),
+    %% Pre-flight: user, virtual host, exchange (order matters for error reporting). See #16587.
+    case rabbit_auth_backend_internal:exists(Username) of
+        true -> ok;
+        false ->
+            ?LOG_WARNING("Failed to set topic permissions on exchange '~ts' for user "
+                         "'~ts' in virtual host '~ts': the user does not exist.",
+                         [Exchange, Username, VirtualHost]),
+            throw({error, {no_such_user, Username}})
+    end,
+    case rabbit_vhost:exists(VirtualHost) of
+        true -> ok;
+        false ->
+            ?LOG_WARNING("Failed to set topic permissions on exchange '~ts' for user "
+                         "'~ts' in virtual host '~ts': the virtual host does not exist.",
+                         [Exchange, Username, VirtualHost]),
+            throw({error, {no_such_vhost, VirtualHost}})
+    end,
+    case rabbit_exchange:exists(rabbit_misc:r(VirtualHost, exchange, Exchange)) of
+        true -> ok;
+        false ->
+            ?LOG_WARNING("Failed to set topic permissions on exchange '~ts' for user "
+                         "'~ts' in virtual host '~ts': the exchange does not exist.",
+                         [Exchange, Username, VirtualHost]),
+            throw({error, {no_such_exchange, Exchange}})
+    end,
     try
         TopicPermission = #topic_permission{
                              topic_permission_key = #topic_permission_key{
@@ -756,10 +803,9 @@ put_user(User, Version, ActingUser) ->
                 {true, true}   ->
                     throw({error, both_password_and_password_hash_are_provided});
                 {false, false} ->
-                    %% this user won't be able to sign in using
-                    %% a username/password pair but can be used for x509 certificate authentication,
-                    %% with authn backends such as HTTP or LDAP and so on.
-                    create_user_with_password(PassedCredentialValidation, Username, <<"">>, Tags, Permissions, Limits, ActingUser)
+                    %% Passwordless user: cannot use password authentication
+                    %% but x509 and other authn backends still work.
+                    create_user_sans_password(Username, Tags, Permissions, Limits, ActingUser)
             end
     end.
 
@@ -790,6 +836,12 @@ create_user_with_password(_PassedCredentialValidation = false, _Username, _Passw
     %% we don't log here because
     %% rabbit_auth_backend_internal will do it
     throw({error, credential_validation_failed}).
+
+create_user_sans_password(Username, Tags, PreconfiguredPermissions, Limits, ActingUser) ->
+    %% Store an empty hash so that the record matches what `clear_password/2` produces.
+    HashingAlgorithm = rabbit_password:hashing_mod(),
+    add_user_sans_validation(Username, <<"">>, HashingAlgorithm, Tags, Limits, ActingUser),
+    preconfigure_permissions(Username, PreconfiguredPermissions, ActingUser).
 
 create_user_with_password_hash(Username, PasswordHash, Tags, User, Version, PreconfiguredPermissions, Limits, ActingUser) ->
     %% when a hash this provided, credential validation
@@ -855,10 +907,10 @@ clear_user_limits(Username, LimitType, ActingUser) ->
     notify_limit_clear(Username, ActingUser).
 
 tag_list_from(Tags) when is_list(Tags) ->
-    [to_atom(string:strip(to_list(T))) || T <- validate_tag_count(Tags)];
+    [to_atom(string:trim(to_list(T))) || T <- validate_tag_count(Tags)];
 tag_list_from(Tags) when is_binary(Tags) ->
-    [to_atom(string:strip(T)) ||
-        T <- validate_tag_count(string:tokens(to_list(Tags), ","))].
+    [to_atom(string:trim(T)) ||
+        T <- validate_tag_count(string:lexemes(to_list(Tags), ","))].
 
 validate_tag_count(Tags) when is_list(Tags), length(Tags) =< ?MAX_USER_TAGS ->
     Tags;
@@ -876,7 +928,7 @@ max_user_tags() ->
 count_user_tags(Tags) when is_list(Tags) ->
     length(Tags);
 count_user_tags(Tags) when is_binary(Tags) ->
-    length(string:tokens(to_list(Tags), ",")).
+    length(string:lexemes(to_list(Tags), ",")).
 
 flatten_errors(L) ->
     case [{F, A} || I <- lists:flatten([L]), {error, F, A} <- [I]] of

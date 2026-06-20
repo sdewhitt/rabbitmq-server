@@ -25,7 +25,8 @@
 -export([get_connections/0]).
 
 %% for tests
--export([purge_connections/0]).
+-export([purge_connections/0,
+         fill_user_dn_pattern/1, escaped_user_dn/1]).
 
 -define(L(F, A),  log("LDAP "         ++ F, A)).
 -define(L1(F, A), log("    LDAP "     ++ F, A)).
@@ -895,9 +896,7 @@ username_to_dn_prebind(Username) ->
               fun (LDAP) -> dn_lookup(Username, LDAP) end).
 
 username_to_dn(Username, LDAP,  postbind) -> dn_lookup(Username, LDAP);
-username_to_dn(Username, _LDAP, _When)    ->
-    ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
-    fill_dn(env(user_dn_pattern), [{username, Username}] ++ ADArgs).
+username_to_dn(Username, _LDAP, _When)    -> escaped_user_dn(Username).
 
 dn_lookup(Username, LDAP) ->
     Filled = fill_user_dn_pattern(Username),
@@ -916,7 +915,8 @@ dn_lookup(Username, LDAP) ->
             ?LOG_WARNING("Searching for DN for ~ts, got back ~tp",
                          [Filled, Entries],
                          #{domain => ?RMQLOG_DOMAIN_LDAP}),
-            Filled;
+            %% Used as a bind DN, so RFC 4514-escape substituted values.
+            escaped_user_dn(Username);
         {error, _} = E ->
             exit(E)
     end.
@@ -925,12 +925,17 @@ fill_user_dn_pattern(Username) ->
     ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
     fill(env(user_dn_pattern), [{username, Username}] ++ ADArgs).
 
+%% The user DN built from `user_dn_pattern' with RFC 4514-escaped
+%% substitutions. A no-op for usernames without DN-special characters.
+escaped_user_dn(Username) ->
+    ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
+    fill_dn(env(user_dn_pattern), [{username, Username}] ++ ADArgs).
+
 simple_bind_fill_pattern(Username) ->
     simple_bind_fill_pattern(env(user_bind_pattern), Username).
 
 simple_bind_fill_pattern(none, Username) ->
-    ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
-    fill_dn(env(user_dn_pattern), [{username, Username}] ++ ADArgs);
+    escaped_user_dn(Username);
 simple_bind_fill_pattern(Pattern, Username) ->
     ADArgs = rabbit_auth_backend_ldap_util:get_active_directory_args(Username),
     fill_dn(Pattern, [{username, Username}] ++ ADArgs).
@@ -961,7 +966,7 @@ scrub_dn(DN, network_unsafe) -> DN;
 scrub_dn(DN, false)          -> DN;
 scrub_dn(DN, _) ->
     case is_dn(DN) of
-        true -> scrub_rdn(string:tokens(DN, ","), []);
+        true -> scrub_rdn(string:lexemes(DN, ","), []);
         _    ->
             %% We aren't fully certain its a DN, & don't know what sensitive
             %% info could be contained, thus just scrub the entire credential
@@ -971,8 +976,8 @@ scrub_dn(DN, _) ->
 scrub_rdn([], Acc) ->
     string:join(lists:reverse(Acc), ",");
 scrub_rdn([DN|Rem], Acc) ->
-    DN0 = case catch string:tokens(DN, "=") of
-              L = [RDN, _] -> case string:to_lower(RDN) of
+    DN0 = case try string:lexemes(DN, "=") catch _:_ -> [] end of
+              L = [RDN, _] -> case string:lowercase(RDN) of
                                   "cn"  -> [RDN, ?SCRUBBED_CREDENTIAL];
                                   "dc"  -> [RDN, ?SCRUBBED_CREDENTIAL];
                                   "ou"  -> [RDN, ?SCRUBBED_CREDENTIAL];
@@ -986,7 +991,9 @@ scrub_rdn([DN|Rem], Acc) ->
   scrub_rdn(Rem, [string:join(DN0, "=")|Acc]).
 
 is_dn(S) when is_list(S) ->
-    case catch string:tokens(rabbit_data_coercion:to_list(S), "=") of
+    case try string:lexemes(rabbit_data_coercion:to_list(S), "=")
+         catch _:_ -> []
+         end of
         L when length(L) > 1 -> true;
         _                    -> false
     end;

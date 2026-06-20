@@ -176,13 +176,8 @@ run([SuperStream],
       timeout := Timeout,
       partitions := Partitions} =
         Opts) ->
-    Streams =
-        [list_to_binary(binary_to_list(SuperStream)
-                        ++ "-"
-                        ++ integer_to_list(K))
-         || K <- lists:seq(0, Partitions - 1)],
-    RoutingKeys =
-        [integer_to_binary(K) || K <- lists:seq(0, Partitions - 1)],
+    Streams = rabbit_stream_utils:streams_from_partitions(SuperStream, Partitions),
+    RoutingKeys = rabbit_stream_utils:routing_keys(Partitions),
     create_super_stream(NodeName,
                         Timeout,
                         VHost,
@@ -196,17 +191,10 @@ run([SuperStream],
       timeout := Timeout,
       binding_keys := BindingKeysStr} =
         Opts) ->
-    BindingKeys =
-        [rabbit_data_coercion:to_binary(
-             string:strip(K))
-         || K
-                <- string:tokens(
-                       rabbit_data_coercion:to_list(BindingKeysStr), ",")],
-    Streams =
-        [list_to_binary(binary_to_list(SuperStream)
-                        ++ "-"
-                        ++ binary_to_list(K))
-         || K <- BindingKeys],
+    BindingKeys = rabbit_stream_utils:binding_keys(BindingKeysStr),
+    Streams = rabbit_stream_utils:streams_from_binding_keys(SuperStream,
+                                                            BindingKeys),
+
     create_super_stream(NodeName,
                         Timeout,
                         VHost,

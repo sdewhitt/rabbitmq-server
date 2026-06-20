@@ -55,6 +55,8 @@
 
 -export([conserve_resources/3, server_properties/1]).
 
+-export([is_over_node_channel_limit/0]).
+
 -define(NORMAL_TIMEOUT, 3).
 -define(CLOSING_TIMEOUT, 30).
 -define(CHANNEL_TERMINATION_TIMEOUT, 3).
@@ -608,7 +610,7 @@ handle_other({conserve_resources, Source, Conserve},
           end,
     control_throttle(State#v1{throttle = Throttle#throttle{blocked_by = Blockers1}});
 handle_other({channel_closing, ChPid}, State) ->
-    ok = rabbit_channel:ready_for_close(ChPid),
+    ok = rabbit_channel_common:ready_for_close(ChPid),
     {_, State1} = channel_cleanup(ChPid, State),
     maybe_close(control_throttle(State1));
 handle_other({'EXIT', Parent, normal}, State = #v1{parent = Parent}) ->
@@ -975,15 +977,24 @@ create_channel(Channel,
                    } = State) ->
     case is_over_limits(Username) of
         false ->
-            {ok, _ChSupPid, {ChPid, AState}} =
-                rabbit_channel_sup_sup:start_channel(
-                  ChanSupSup, {tcp, Sock, Channel, FrameMax, self(), Name,
-                               User, VHost, Capabilities,
-                               Collector}),
-            MRef = erlang:monitor(process, ChPid),
-            put({ch_pid, ChPid}, {Channel, MRef}),
-            put({channel, Channel}, {ChPid, AState}),
-            {ok, {ChPid, AState}, State#v1{channel_count = ChannelCount + 1}};
+            case rabbit_channel_sup_sup:start_channel(
+                   ChanSupSup, {tcp, Sock, Channel, FrameMax, self(), Name,
+                                User, VHost, Capabilities,
+                                Collector}) of
+                {ok, _ChSupPid, {ChPid, AState}} ->
+                    MRef = erlang:monitor(process, ChPid),
+                    put({ch_pid, ChPid}, {Channel, MRef}),
+                    put({channel, Channel}, {ChPid, AState}),
+                    {ok, {ChPid, AState}, State#v1{channel_count = ChannelCount + 1}};
+                {error, Reason} ->
+                    ?LOG_ERROR(
+                        "Connection ~ts failed to open channel ~tp: ~tp",
+                        [Name, Channel, Reason]),
+                    {error, rabbit_misc:amqp_error(
+                              internal_error,
+                              "failed to open channel ~tp",
+                              [Channel], none)}
+            end;
         {true, Limit, Fmt, FmtArg} ->
             {error, rabbit_misc:amqp_error(
                       not_allowed,
@@ -1000,13 +1011,13 @@ is_over_limits(Username) ->
                 {true, Limit} ->
                     Fmt =
                         "number of channels opened on node '~ts' has reached "
-                        "the maximum allowed limit of (~w)",
+                        "the maximum allowed limit of ~w",
                     {true, Limit, Fmt, node()}
             end;
         {true, Limit} ->
             Fmt =
                 "number of channels opened for user '~ts' has reached "
-                "the maximum allowed user limit of (~w)",
+                "the maximum allowed user limit of ~w",
             {true, Limit, Fmt, Username}
     end.
 
@@ -1089,11 +1100,11 @@ process_frame(Frame, Channel, State) ->
                     put(ChKey, {ChPid, NewAState}),
                     post_process_frame(Frame, ChPid, State1);
                 {ok, Method, NewAState} ->
-                    rabbit_channel:do(ChPid, Method),
+                    rabbit_channel_common:do(ChPid, Method),
                     put(ChKey, {ChPid, NewAState}),
                     post_process_frame(Frame, ChPid, State1);
                 {ok, Method, Content, NewAState} ->
-                    rabbit_channel:do_flow(ChPid, Method, Content),
+                    rabbit_channel_common:do_flow(ChPid, Method, Content),
                     put(ChKey, {ChPid, NewAState}),
                     post_process_frame(Frame, ChPid, control_throttle(State1));
                 {error, Reason} ->
@@ -1282,14 +1293,13 @@ handle_method0(#'connection.tune_ok'{frame_max   = FrameMax,
     Parent = self(),
     SendFun =
         fun() ->
-                case catch rabbit_net:send(Sock, Frame) of
+                case try rabbit_net:send(Sock, Frame)
+                     catch _:E -> {error, E}
+                     end of
                     ok ->
                         ok;
                     {error, Reason} ->
                         Parent ! {heartbeat_send_error, Reason},
-                        ok;
-                    Unexpected ->
-                        Parent ! {heartbeat_send_error, Unexpected},
                         ok
                 end,
                 ok
@@ -1924,9 +1934,9 @@ gen_call(Pid, Req, Timeout) ->
     %% We use gen:call/4 with label rabbit_call instead of gen_server:call/3 with label '$gen_call'
     %% because cowboy_websocket does not let rabbit_web_amqp_handler handle '$gen_call' messages:
     %% https://github.com/ninenines/cowboy/blob/2.12.0/src/cowboy_websocket.erl#L427-L430
-    case catch gen:call(Pid, rabbit_call, Req, Timeout) of
-        {ok, Res} ->
-            Res;
-        {'EXIT', Reason} ->
+    try gen:call(Pid, rabbit_call, Req, Timeout) of
+        {ok, Res} -> Res
+    catch
+        _:Reason ->
             exit({Reason, {?MODULE, ?FUNCTION_NAME, [Pid, Req, Timeout]}})
     end.

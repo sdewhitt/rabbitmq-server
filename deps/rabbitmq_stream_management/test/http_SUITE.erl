@@ -28,6 +28,7 @@ groups() ->
                                create_super_stream,
                                create_super_stream_requires_configure_permission,
                                create_super_stream_partition_limits,
+                               create_super_stream_binding_keys_limit,
                                stream_tracking_requires_vhost_access
                               ]}].
 
@@ -182,6 +183,17 @@ create_super_stream_partition_limits(Config) ->
              #{partitions => 1000}, {group, '2xx'}),
     ok.
 
+create_super_stream_binding_keys_limit(Config) ->
+    %% A binding-keys list exceeding the partition limit (default 1000) is rejected.
+    OverLimit = iolist_to_binary(
+                  lists:join(
+                    <<",">>,
+                    [<<"k", (integer_to_binary(N))/binary>>
+                     || N <- lists:seq(0, 1000)])),
+    http_put(Config, "/stream/super-streams/%2F/too-many-binding-keys",
+             #{'binding-keys' => OverLimit}, ?BAD_REQUEST),
+    ok.
+
 stream_tracking_requires_vhost_access(Config) ->
     Vhost = <<"tracking-vh">>,
     User = <<"tracking-user">>,
@@ -192,7 +204,7 @@ stream_tracking_requires_vhost_access(Config) ->
     rabbit_ct_broker_helpers:add_user(Config, User, User),
     rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
     http_get(Config, "/stream/tracking-vh/test-stream/tracking",
-             User, User, ?NOT_AUTHORISED),
+             User, User, 404),
     %% Permissions granted, must succeed.
     rabbit_ct_broker_helpers:set_full_permissions(Config, User, Vhost),
     http_get(Config, "/stream/tracking-vh/test-stream/tracking",

@@ -10,7 +10,15 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 
+-import(rabbit_ct_helpers,
+        [set_config/2,
+         run_setup_steps/2,
+         setup_steps/0,
+         merge_app_env/2]).
+
 -compile(export_all).
+
+-define(TEST_MAX_SUPER_STREAM_PARTITIONS, 5).
 
 all() ->
     [{group, non_parallel_tests}].
@@ -18,6 +26,8 @@ all() ->
 groups() ->
     [{non_parallel_tests, [],
       [manage_super_stream,
+       manage_super_stream_max_partitions,
+       manage_super_stream_max_partitions_infinity,
        lookup_leader,
        lookup_member,
        partition_index,
@@ -40,35 +50,49 @@ end_per_suite(Config) ->
     Config.
 
 init_per_group(_, Config) ->
-    Config1 =
-        rabbit_ct_helpers:set_config(Config, [{rmq_nodes_clustered, false}]),
-    Config2 =
-        rabbit_ct_helpers:set_config(Config1,
-                                     {rabbitmq_ct_tls_verify, verify_none}),
-    Config3 =
-        rabbit_ct_helpers:set_config(Config2, {rabbitmq_stream, verify_none}),
-    rabbit_ct_helpers:run_setup_steps(Config3,
-                                      [fun(StepConfig) ->
-                                          rabbit_ct_helpers:merge_app_env(StepConfig,
-                                                                          {rabbit,
-                                                                           [{core_metrics_gc_interval,
-                                                                             1000}]})
-                                       end,
-                                       fun(StepConfig) ->
-                                          rabbit_ct_helpers:merge_app_env(StepConfig,
-                                                                          {rabbitmq_stream,
-                                                                           [{connection_negotiation_step_timeout,
-                                                                             500}]})
-                                       end]
-                                      ++ rabbit_ct_broker_helpers:setup_steps()).
+    Config1 = set_config(Config,
+                         [{rmq_nodes_clustered, false},
+                          {rabbitmq_ct_tls_verify, verify_none},
+                          {rabbitmq_stream, verify_none}
+                         ]),
+
+    RmqAppConf = {rabbit,
+                  [{core_metrics_gc_interval,
+                    1000}]},
+    RmqStreamAppConf = {rabbitmq_stream,
+                        [{connection_negotiation_step_timeout, 500},
+                         {max_super_stream_partitions, ?TEST_MAX_SUPER_STREAM_PARTITIONS}]},
+    run_setup_steps(Config1,
+                    [fun(StepConfig) ->
+                             merge_app_env(StepConfig, RmqAppConf)
+                     end,
+                     fun(StepConfig) ->
+                             merge_app_env(StepConfig, RmqStreamAppConf)
+                     end]
+                    ++ rabbit_ct_broker_helpers:setup_steps()).
 
 end_per_group(_, Config) ->
     rabbit_ct_helpers:run_steps(Config,
                                 rabbit_ct_broker_helpers:teardown_steps()).
 
+init_per_testcase(manage_super_stream_max_partitions_infinity = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config,
+                                      0,
+                                      application,
+                                      set_env,
+                                      [rabbitmq_stream, max_super_stream_partitions, infinity]),
+    rabbit_ct_helpers:testcase_started(Config, TestCase);
 init_per_testcase(Testcase, Config) ->
     rabbit_ct_helpers:testcase_started(Config, Testcase).
 
+end_per_testcase(manage_super_stream_max_partitions_infinity = TestCase, Config) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config,
+                                      0,
+                                      application,
+                                      set_env,
+                                      [rabbitmq_stream, max_super_stream_partitions,
+                                       ?TEST_MAX_SUPER_STREAM_PARTITIONS]),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(Testcase, Config) ->
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
 
@@ -148,6 +172,35 @@ manage_super_stream(Config) ->
                                      [<<"invoices-0">>, <<"invoices-1">>],
                                      [<<"0">>])),
 
+    ok.
+
+manage_super_stream_max_partitions(Config) ->
+    Partitions = ?TEST_MAX_SUPER_STREAM_PARTITIONS + 1,
+    Name = <<"invoices">>,
+    Streams =[<<Name/binary, "-", (integer_to_binary(K))/binary>> ||
+              K <- lists:seq(0, Partitions - 1)],
+    RKs = [integer_to_binary(K) || K <- lists:seq(0, Partitions - 1)],
+
+    ?assertEqual({error,
+                  {validation_failed,
+                   {"The partition number must not exceed 5"}}},
+                 create_super_stream(Config, Name, Streams, RKs)),
+
+    ok.
+
+manage_super_stream_max_partitions_infinity(Config) ->
+    Partitions = ?TEST_MAX_SUPER_STREAM_PARTITIONS + 1,
+    Name = <<"invoices">>,
+    Streams =[<<Name/binary, "-", (integer_to_binary(K))/binary>> ||
+              K <- lists:seq(0, Partitions - 1)],
+    RKs = [integer_to_binary(K) || K <- lists:seq(0, Partitions - 1)],
+
+    ?assertEqual(ok,
+                 create_super_stream(Config, Name, Streams, RKs)),
+    ?assertEqual({ok, Streams},
+                 partitions(Config, <<"invoices">>)),
+
+    ?assertEqual(ok, delete_super_stream(Config, <<"invoices">>)),
     ok.
 
 partition_index(Config) ->

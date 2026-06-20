@@ -29,7 +29,7 @@
 -export([filter_conn_ch_list/3, filter_user/2, list_login_vhosts/2,
          list_login_vhosts_names/2]).
 -export([filter_tracked_conn_list/3]).
--export([with_decode/5, decode/1, decode/2, set_resp_header/3,
+-export([with_decode/5, decode/1, decode/2,
          args/1, read_complete_body/1, read_complete_body_with_limit/2]).
 -export([reply_list/3, reply_list/5, reply_list/4,
          sort_list/2, destination_type/1, reply_list_or_paginate/3
@@ -46,6 +46,7 @@
 -export([direct_request/6]).
 -export([qs_val/2]).
 -export([get_path_prefix/0]).
+-export([prefixed_path/1]).
 -export([catch_no_such_user_or_vhost/2]).
 -export([method_not_allowed/3]).
 
@@ -264,7 +265,7 @@ reply(Facts, ReqData, Context) ->
     reply0(extract_columns(Facts, ReqData), ReqData, Context).
 
 reply0(Facts, ReqData, Context) ->
-    ReqData1 = set_resp_header(<<"cache-control">>, "no-cache", ReqData),
+    ReqData1 = cowboy_req:set_resp_header(<<"cache-control">>, "no-cache", ReqData),
     try
         case maps:get(media_type, ReqData1, undefined) of
             {<<"application">>, <<"bert">>, _} ->
@@ -466,6 +467,12 @@ fixup_prefix(EnvPrefix) when is_list(EnvPrefix) ->
 fixup_prefix(EnvPrefix) when is_binary(EnvPrefix) ->
     fixup_prefix(rabbit_data_coercion:to_list(EnvPrefix)).
 
+%% Prepends the configured path prefix to Path, returning a binary.
+%% Used wherever a cookie or redirect path must reflect the management
+%% plugin's configured path_prefix.
+prefixed_path(Path) ->
+    iolist_to_binary([get_path_prefix(), Path]).
+
 %% XXX sort_list_and_paginate/2 is a more proper name for this function, keeping it
 %% with this name for backwards compatibility
 -spec sort_list([Fact], [string()]) -> [Fact] when
@@ -510,16 +517,14 @@ maybe_filter_context(List, _) ->
 
 
 match_value({_, Value}, ValueTag, UseRegex) when UseRegex =:= "true" ->
-    case re:run(Value, ValueTag, [caseless,
-                                  {match_limit, 50_000},
-                                  {match_limit_recursion, 50_000}]) of
+    case rabbit_re:run(Value, ValueTag, [caseless]) of
         {match, _} -> true;
         {error, _} -> false;
         nomatch -> false
     end;
 match_value({_, Value}, ValueTag, _) ->
-    Pos = string:str(string:to_lower(binary_to_list(Value)),
-        string:to_lower(ValueTag)),
+    Pos = string:str(string:lowercase(binary_to_list(Value)),
+        string:lowercase(ValueTag)),
     case Pos of
         Pos  when Pos > 0 -> true;
         _ -> false
@@ -627,7 +632,7 @@ sort_key(Item, [Sort | Sorts]) ->
     [get_dotted_value(Sort, Item) | sort_key(Item, Sorts)].
 
 get_dotted_value(Key, Item) ->
-    Keys = string:tokens(Key, "."),
+    Keys = string:lexemes(Key, "."),
     get_dotted_value0(Keys, Item).
 
 get_dotted_value0([Key], Item) ->
@@ -665,8 +670,8 @@ extract_columns_list(Items, ReqData) ->
 columns(ReqData) ->
     case qs_val(<<"columns">>, ReqData) of
         undefined -> all;
-        Bin       -> [[list_to_binary(T) || T <- string:tokens(C, ".")]
-                      || C <- string:tokens(binary_to_list(Bin), ",")]
+        Bin       -> [[list_to_binary(T) || T <- string:lexemes(C, ".")]
+                      || C <- string:lexemes(binary_to_list(Bin), ",")]
     end.
 
 extract_column_items(Item, all) ->
@@ -1076,7 +1081,10 @@ filter_vhost({vhost, _VHost}, _IsAdmin=true, List, _ReqData, _Context) ->
     [I || I <- List, lists:member(pget(vhost, I), rabbit_vhost:list())];
 filter_vhost({vhost, VHost}, _IsAdmin=false, List, ReqData, #context{user = User}) ->
     AuthzData = get_authz_data(ReqData),
-    case catch rabbit_access_control:check_vhost_access(User, VHost, AuthzData, #{}) of
+    Res = try rabbit_access_control:check_vhost_access(User, VHost, AuthzData, #{})
+          catch _:E -> {error, E}
+          end,
+    case Res of
         ok ->
             [I || I <- List, pget(vhost, I) =:= VHost];
         NotOK ->
@@ -1135,11 +1143,6 @@ filter_tracked_conn_list(List, ReqData, #context{user = #user{username = FilterU
               {node, Node}] || #tracked_connection{name = Name, vhost = VHost, username = Username, node = Node} <- List, VHost == FilterVHost, Username == FilterUsername]
     end.
 
-set_resp_header(K, V, ReqData) ->
-    cowboy_req:set_resp_header(K, strip_crlf(V), ReqData).
-
-strip_crlf(Str) -> lists:append(string:tokens(Str, "\r\n")).
-
 args([]) -> args(#{});
 args(L)  -> rabbit_mgmt_format:to_amqp_table(L).
 
@@ -1175,24 +1178,35 @@ list_visible_vhosts(User = #user{tags = Tags}, AuthzData) ->
 
 list_login_vhosts_names(User, AuthzData) ->
     [V || V <- rabbit_vhost:list_names(),
-          case catch rabbit_access_control:check_vhost_access(User, V, AuthzData, #{}) of
-              ok -> true;
-              NotOK ->
-                  log_access_control_result(NotOK),
-                  false
+          begin
+              Res = try rabbit_access_control:check_vhost_access(User, V, AuthzData, #{})
+                    catch _:E -> {error, E}
+                    end,
+              case Res of
+                  ok -> true;
+                  NotOK ->
+                      log_access_control_result(NotOK),
+                      false
+              end
           end].
 
 list_login_vhosts(User, AuthzData) ->
     [V || V <- rabbit_vhost:all(),
-          case catch rabbit_access_control:check_vhost_access(User, vhost:get_name(V), AuthzData, #{}) of
-              ok -> true;
-              NotOK ->
-                  log_access_control_result(NotOK),
-                  false
+          begin
+              Res = try rabbit_access_control:check_vhost_access(
+                            User, vhost:get_name(V), AuthzData, #{})
+                    catch _:E -> {error, E}
+                    end,
+              case Res of
+                  ok -> true;
+                  NotOK ->
+                      log_access_control_result(NotOK),
+                      false
+              end
           end].
 
 % rabbitmq/rabbitmq-auth-backend-http#100
-log_access_control_result({'EXIT', #amqp_error{name = Name, explanation = Msg}}) ->
+log_access_control_result({error, #amqp_error{name = Name, explanation = Msg}}) ->
     ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: '~tp', ~ts", [Name, Msg]);
 log_access_control_result(NotOK) ->
     ?LOG_DEBUG("rabbit_access_control:check_vhost_access result: ~tp", [NotOK]).
@@ -1271,9 +1285,10 @@ ceil(X) ->
 int(Name, ReqData) ->
     case qs_val(list_to_binary(Name), ReqData) of
         undefined -> undefined;
-        Bin       -> case catch list_to_integer(binary_to_list(Bin)) of
-                         {'EXIT', _} -> undefined;
-                         Integer     -> Integer
+        Bin       -> try list_to_integer(binary_to_list(Bin)) of
+                         Integer -> Integer
+                     catch
+                         _:_ -> undefined
                      end
     end.
 

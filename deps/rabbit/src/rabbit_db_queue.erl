@@ -22,6 +22,7 @@
          get_targets/1,
          get_all/0,
          get_all/1,
+         fold/2,
          get_all_by_type/1,
          get_all_by_type_and_vhost/2,
          get_all_by_type_and_node/3,
@@ -100,6 +101,28 @@ get_all() ->
                       []
               end
       end).
+
+-spec fold(Fun, Acc) -> Acc when
+      Fun :: fun((Queue :: amqqueue:amqqueue(), Acc) -> Acc),
+      Acc :: term().
+
+%% @doc Folds over all queue records without materialising them into a list,
+%% making it more memory-efficient than `get_all/0` followed by a fold over the
+%% returned list. Useful when iterating over very large numbers of queues.
+%%
+%% @returns the fold accumulator.
+%%
+%% @private
+
+%% Not wrapped in list_with_possible_retry/1: the callback may have side effects
+%% and the accumulator is arbitrary, so the fold must never be replayed.
+fold(Fun, Acc) ->
+    try
+        ets:foldl(Fun, Acc, ?KHEPRI_PROJECTION)
+    catch
+        error:badarg ->
+            Acc
+    end.
 
 -spec get_all(VHostName) -> [Queue] when
       VHostName :: vhost:name(),
@@ -1016,9 +1039,10 @@ tie_binding_to_dest_with_keep_while_cond_enable(
                        "auto-delete exchanges",
                        [FeatureName],
                        #{domain => ?RMQLOG_DOMAIN_DB}),
+                    %% `#if_has_data{}' skips data-less intermediate nodes.
                     ExchangePattern = rabbit_db_exchange:khepri_exchange_path(
                                         ?KHEPRI_WILDCARD_STAR,
-                                        ?KHEPRI_WILDCARD_STAR),
+                                        #if_has_data{}),
                     ok = khepri_tx:foreach(
                            ExchangePattern,
                            fun(ExchangePath, #{data := Exchange}) ->
@@ -1040,12 +1064,13 @@ tie_binding_to_dest_with_keep_while_cond_enable(
                        "bindings",
                        [FeatureName],
                        #{domain => ?RMQLOG_DOMAIN_DB}),
+                    %% Same `#if_has_data{}' guard as above.
                     BindingPattern = rabbit_db_binding:khepri_route_path(
                                        ?KHEPRI_WILDCARD_STAR,
                                        ?KHEPRI_WILDCARD_STAR,
                                        ?KHEPRI_WILDCARD_STAR,
                                        ?KHEPRI_WILDCARD_STAR,
-                                       ?KHEPRI_WILDCARD_STAR),
+                                       #if_has_data{}),
                     ok = khepri_tx:foreach(
                            BindingPattern,
                            fun(BindingPath, #{data := Set}) ->

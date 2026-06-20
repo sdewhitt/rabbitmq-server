@@ -84,6 +84,7 @@ var ALL_COLUMNS =
                    ['state',                'State',                  true]],
       'Messages': [['msgs-ready',      'Ready',          true],
                    ['msgs-unacked',    'Unacknowledged', true],
+                   ['msgs-delayed',    'Delayed',        false],
                    ['msgs-ram',        'In memory',      false],
                    ['msgs-persistent', 'Persistent',     false],
                    ['msgs-total',      'Total',          true]],
@@ -313,7 +314,7 @@ var HELP = {
       'Only users within the internal RabbitMQ database are shown here. Other users (e.g. those authenticated over LDAP) will not appear.',
 
     'export-definitions':
-    'The definitions consist of users, virtual hosts, permissions, parameters, exchanges, queues, policies and bindings. They do not include the contents of queues. Exclusive queues will not be exported.',
+    'The definitions consist of users, virtual hosts, permissions, parameters, exchanges, queues, policies and bindings. They do not include the contents of queues. Exclusive queues will not be exported. The download filename may only contain token characters (letters, digits and !#$%&\'*+-.^_`|~).',
 
     'export-definitions-vhost':
     'The definitions exported for a single virtual host consist of exchanges, queues, bindings and policies.',
@@ -764,7 +765,7 @@ function setup_global_vars(overview) {
     user_administrator = jQuery.inArray("administrator", user_tags) != -1;
     is_user_policymaker = jQuery.inArray("policymaker", user_tags) != -1;
     user_monitor = jQuery.inArray("monitoring", user_tags) != -1;
-    exchange_types = overview.exchange_types.map(function(xt) { return xt.name; });
+    exchange_types = overview.exchange_types.map(function(xt) { return fmt_escape_html_one_line(xt.name); });
 
     cluster_name = fmt_escape_html(overview.cluster_name);
     $('#logout').before(

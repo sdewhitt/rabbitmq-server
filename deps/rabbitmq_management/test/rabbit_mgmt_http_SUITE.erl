@@ -104,7 +104,8 @@ definitions_group2_tests() ->
 definitions_group3_tests() ->
     [
         definitions_server_named_queue_test,
-        definitions_with_charset_test
+        definitions_with_charset_test,
+        definitions_large_streamed_test
     ].
 
 definitions_group4_tests() ->
@@ -193,6 +194,7 @@ all_tests() -> [
     publish_large_message_exceeding_http_request_body_size_test,
     publish_body_size_limit_single_chunk_test,
     direct_request_body_size_limit_test,
+    definitions_multipart_body_size_limit_test,
     publish_accept_json_test,
     publish_fail_test,
     publish_base64_test,
@@ -893,8 +895,19 @@ csv_tags(N) ->
 %% "external" authentication mechanism or backend is used.
 %% See rabbitmq/rabbitmq-management#383.
 adding_a_user_without_password_or_hash_test(Config) ->
+    %% Regression: rabbitmq/rabbitmq-server#16629.
     http_put(Config, "/users/no-pwd", [{tags, <<"management">>}], [?CREATED, ?NO_CONTENT]),
+    assert_item(#{name              => <<"no-pwd">>,
+                  tags              => [<<"management">>],
+                  password_hash     => <<>>,
+                  hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
+                http_get(Config, "/users/no-pwd")),
     http_put(Config, "/users/no-pwd", [{tags, <<"management">>}], [?CREATED, ?NO_CONTENT]),
+    assert_item(#{name              => <<"no-pwd">>,
+                  tags              => [<<"management">>],
+                  password_hash     => <<>>,
+                  hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
+                http_get(Config, "/users/no-pwd")),
     http_delete(Config, "/users/no-pwd", ?NO_CONTENT).
 
 adding_a_user_with_both_password_and_hash_fails_test(Config) ->
@@ -1163,7 +1176,7 @@ connections_amqp(Config) ->
     after 5000 -> ct:fail(opened_timeout)
     end,
     eventually(?_assertEqual(1, length(http_get(Config, "/connections"))), 1000, 10),
-    ?assertEqual(1, length(rpc(Config, rabbit_amqp1_0, list_local, []))),
+    ?assertEqual(1, length(rpc(Config, rabbit_amqp_reader, local_connections, []))),
     [Connection1] = http_get(Config, "/connections"),
     ?assertMatch(#{node := Node,
                    vhost := <<"/">>,
@@ -1205,7 +1218,7 @@ connections_amqp(Config) ->
     end,
     eventually(?_assertNot(is_process_alive(C2))),
     eventually(?_assertEqual([], http_get(Config, "/connections")), 10, 5),
-    ?assertEqual(0, length(rpc(Config, rabbit_amqp1_0, list_local, []))).
+    ?assertEqual(0, length(rpc(Config, rabbit_amqp_reader, local_connections, []))).
 
 %% Test that AMQP 1.0 sessions and links can be listed via the rabbitmq_management plugin.
 amqp_sessions(Config) ->
@@ -1825,11 +1838,11 @@ permissions_vhost_test(Config) ->
                 http_get(Config, Path1 ++ "/myvhost1/" ++ Path2, "myuser", "myuser",
                          ?OK),
                 http_get(Config, Path1 ++ "/myvhost2/" ++ Path2, "myuser", "myuser",
-                         ?NOT_AUTHORISED),
+                         ?NOT_FOUND),
                 http_get(Config, Path1 ++ "/myvhost1/" ++ Path2, "mymonitor", "mymonitor",
                          ?OK),
                 http_get(Config, Path1 ++ "/myvhost2/" ++ Path2, "mymonitor", "mymonitor",
-                         ?NOT_AUTHORISED)
+                         ?NOT_FOUND)
         end,
     Test3 =
         fun(Path1) ->
@@ -2282,12 +2295,16 @@ definitions_vhost_metadata_test(Config) ->
     {value, VH} = lists:search(fun(VH) ->
                                     maps:get(name, VH) =:= VHostName
                                 end, VHosts),
-    ?assertEqual(#{
-        name => VHostName,
-        description => Desc,
-        tags => Tags,
-        metadata => Metadata
-    }, VH),
+    %% The definitions export uses the canonical rabbit_definitions format
+    %% (the same one as `rabbitmqctl export_definitions`): a virtual host
+    %% carries `name', `metadata' and `limits'; its description and tags live
+    %% inside `metadata' rather than being duplicated at the top level.
+    ?assertEqual(VHostName, maps:get(name, VH)),
+    ?assert(is_map(maps:get(limits, VH))),
+    VHMetadata = maps:get(metadata, VH),
+    ?assertEqual(Desc, maps:get(description, VHMetadata)),
+    ?assertEqual(DQT, maps:get(default_queue_type, VHMetadata)),
+    ?assertEqual(Tags, maps:get(tags, VHMetadata)),
 
     %% Post the definitions back
     http_post(Config, "/definitions", Definitions, {group, '2xx'}),
@@ -2423,6 +2440,42 @@ definitions_vhost_test(Config) ->
     http_post(Config, "/definitions/othervhost", Upload, ?NOT_FOUND),
 
     unregister_parameters_and_policy_validator(Config),
+    passed.
+
+%% Exercises the streamed export across the STREAM_BATCH_SIZE (2000) boundary:
+%% every queue and binding must be returned exactly once, in the canonical
+%% format (queues carry their type), with the per-item vhost field stripped.
+definitions_large_streamed_test(Config) ->
+    VHost = "definitions-large-streamed",
+    http_put(Config, "/vhosts/" ++ VHost, #{}, {group, '2xx'}),
+    Perms = [{configure, <<".*">>}, {write, <<".*">>}, {read, <<".*">>}],
+    http_put(Config, "/permissions/" ++ VHost ++ "/guest", Perms, {group, '2xx'}),
+
+    N = 2200,
+    Names = [<<"lq-", (integer_to_binary(I))/binary>> || I <- lists:seq(1, N)],
+    Queues = [#{name => Name, durable => true} || Name <- Names],
+    Bindings = [#{source => <<"amq.direct">>, destination => Name,
+                  destination_type => <<"queue">>,
+                  routing_key => <<"rk-", (integer_to_binary(I))/binary>>,
+                  arguments => #{}}
+                || {I, Name} <- lists:zip(lists:seq(1, N), Names)],
+    http_post(Config, "/definitions/" ++ VHost,
+              #{queues => Queues, bindings => Bindings}, {group, '2xx'}),
+
+    Defs = http_get(Config, "/definitions/" ++ VHost, ?OK),
+    QS = maps:get(queues, Defs),
+    BS = maps:get(bindings, Defs),
+    %% Every item present exactly once: no drops or duplicates at batch edges.
+    ?assertEqual(N, length(QS)),
+    ?assertEqual(N, length(lists:usort([maps:get(name, Q) || Q <- QS]))),
+    ?assertEqual(N, length(BS)),
+    %% Canonical format: queues carry their type, the scoped export drops vhost.
+    ?assert(lists:all(fun(Q) -> maps:is_key(type, Q) end, QS)),
+    ?assertEqual([], [Q || Q <- QS, maps:is_key(vhost, Q)]),
+    %% Empty limits are exported as a JSON object, not a list.
+    ?assert(is_map(maps:get(limits, Defs))),
+
+    http_delete(Config, "/vhosts/" ++ VHost, {group, '2xx'}),
     passed.
 
 definitions_password_test(Config) ->
@@ -3340,7 +3393,7 @@ get_fail_test(Config) ->
     http_post(Config, "/queues/%2F/myqueue/get",
               [{ackmode, ack_requeue_false},
                {count,    1},
-               {encoding, auto}], "myuser", "password", ?NOT_AUTHORISED),
+               {encoding, auto}], "myuser", "password", ?NOT_FOUND),
     http_delete(Config, "/queues/%2F/myqueue", {group, '2xx'}),
     http_delete(Config, "/users/myuser", {group, '2xx'}),
     passed.
@@ -3428,6 +3481,27 @@ direct_request_body_size_limit_test(Config) ->
     rpc(Config, application, unset_env, [rabbitmq_management, max_http_body_size])
   end.
 
+definitions_multipart_body_size_limit_test(Config) ->
+    rpc(Config, application, set_env, [rabbitmq_management, max_http_body_size, 200]),
+    try
+        %% A small but valid definitions payload, turned into an oversized
+        %% multipart upload by appending padding.
+        SmallDefs = #{users => [], vhosts => [#{name => <<"test">>}]},
+        Data = binary_to_list(format_for_upload(SmallDefs)),
+        Boundary = "------------definitions_multipart_body_size_limit_test",
+        LargeBody = list_to_binary(lists:duplicate(300, $\s)),
+        OversizedMultipart = format_multipart_filedata(Boundary,
+            [{file, "file", Data ++ binary_to_list(LargeBody)}]),
+        ContentType = lists:concat(["multipart/form-data; boundary=", Boundary]),
+        MoreHeaders = [{"content-type", ContentType},
+                       {"content-length", integer_to_list(length(OversizedMultipart))}],
+        http_upload_raw(Config, post, "/definitions", OversizedMultipart,
+                        "guest", "guest", ?BAD_REQUEST, MoreHeaders),
+        passed
+    after
+        rpc(Config, application, unset_env, [rabbitmq_management, max_http_body_size])
+    end.
+
 publish_accept_json_test(Config) ->
     Headers = #{'x-forwarding' => [#{uri => <<"amqp://localhost/%2F/upstream">>}]},
     Msg = msg(<<"publish_accept_json_test">>, Headers, <<"Hello world">>),
@@ -3456,7 +3530,7 @@ publish_fail_test(Config) ->
     http_put(Config, "/users/myuser", [{password, <<"password">>},
                                        {tags, <<"management">>}], {group, '2xx'}),
     http_post(Config, "/exchanges/%2F/amq.default/publish", Msg, "myuser", "password",
-              ?NOT_AUTHORISED),
+              ?NOT_FOUND),
     Msg2 = [{exchange,         <<"">>},
             {routing_key,      <<"publish_fail_test">>},
             {properties,       [{user_id, <<"foo">>}]},
@@ -3729,12 +3803,22 @@ policy_permissions_test(Config) ->
                   http_get(Config, "/policies/v/HA",            U, U, ?NOT_AUTHORISED),
                   http_get(Config, "/parameters/test/v/good",   U, U, ?NOT_AUTHORISED)
           end,
+    %% mon and mgmt lack policymaker role entirely, so they get 401.
+    %% policy has policymaker role but no access to the default vhost, so it gets 404
+    %% (the server does not reveal whether the vhost exists to unauthorised users).
     AlwaysNeg =
         fun (U) ->
                 http_put(Config, "/policies/%2F/HA",  Policy, U, U, ?NOT_AUTHORISED),
                 http_put(Config, "/parameters/test/%2F/good", Param, U, U, ?NOT_AUTHORISED),
                 http_get(Config, "/policies/%2F/HA",          U, U, ?NOT_AUTHORISED),
                 http_get(Config, "/parameters/test/%2F/good", U, U, ?NOT_AUTHORISED)
+        end,
+    AlwaysNegPolicymaker =
+        fun (U) ->
+                http_put(Config, "/policies/%2F/HA",  Policy, U, U, ?NOT_FOUND),
+                http_put(Config, "/parameters/test/%2F/good", Param, U, U, ?NOT_FOUND),
+                http_get(Config, "/policies/%2F/HA",          U, U, ?NOT_FOUND),
+                http_get(Config, "/parameters/test/%2F/good", U, U, ?NOT_FOUND)
         end,
     AdminPos =
         fun (U) ->
@@ -3746,7 +3830,8 @@ policy_permissions_test(Config) ->
 
     [Neg(U) || U <- ["mon", "mgmt"]],
     [Pos(U) || U <- ["admin", "policy"]],
-    [AlwaysNeg(U) || U <- ["mon", "mgmt", "policy"]],
+    [AlwaysNeg(U) || U <- ["mon", "mgmt"]],
+    AlwaysNegPolicymaker("policy"),
     [AdminPos(U) || U <- ["admin"]],
 
     %% This one is deliberately different between admin and policymaker.
@@ -3880,8 +3965,8 @@ vhost_limits_list_test(Config) ->
     rabbit_ct_broker_helpers:add_user(Config, NoVhostUser),
     rabbit_ct_broker_helpers:set_user_tags(Config, 0, NoVhostUser, [management]),
     [] = http_get(Config, "/vhost-limits", NoVhostUser, NoVhostUser, ?OK),
-    http_get(Config, "/vhost-limits/limit_test_vhost_1", NoVhostUser, NoVhostUser, ?NOT_AUTHORISED),
-    http_get(Config, "/vhost-limits/limit_test_vhost_2", NoVhostUser, NoVhostUser, ?NOT_AUTHORISED),
+    http_get(Config, "/vhost-limits/limit_test_vhost_1", NoVhostUser, NoVhostUser, ?NOT_FOUND),
+    http_get(Config, "/vhost-limits/limit_test_vhost_2", NoVhostUser, NoVhostUser, ?NOT_FOUND),
 
     Vhost1User = <<"limit_test_vhost_1_user">>,
     rabbit_ct_broker_helpers:add_user(Config, Vhost1User),
@@ -3889,14 +3974,14 @@ vhost_limits_list_test(Config) ->
     rabbit_ct_broker_helpers:set_full_permissions(Config, Vhost1User, <<"limit_test_vhost_1">>),
     Limits1 = http_get(Config, "/vhost-limits", Vhost1User, Vhost1User, ?OK),
     Limits1 = http_get(Config, "/vhost-limits/limit_test_vhost_1", Vhost1User, Vhost1User, ?OK),
-    http_get(Config, "/vhost-limits/limit_test_vhost_2", Vhost1User, Vhost1User, ?NOT_AUTHORISED),
+    http_get(Config, "/vhost-limits/limit_test_vhost_2", Vhost1User, Vhost1User, ?NOT_FOUND),
 
     Vhost2User = <<"limit_test_vhost_2_user">>,
     rabbit_ct_broker_helpers:add_user(Config, Vhost2User),
     rabbit_ct_broker_helpers:set_user_tags(Config, 0, Vhost2User, [management]),
     rabbit_ct_broker_helpers:set_full_permissions(Config, Vhost2User, <<"limit_test_vhost_2">>),
     Limits2 = http_get(Config, "/vhost-limits", Vhost2User, Vhost2User, ?OK),
-    http_get(Config, "/vhost-limits/limit_test_vhost_1", Vhost2User, Vhost2User, ?NOT_AUTHORISED),
+    http_get(Config, "/vhost-limits/limit_test_vhost_1", Vhost2User, Vhost2User, ?NOT_FOUND),
     Limits2 = http_get(Config, "/vhost-limits/limit_test_vhost_2", Vhost2User, Vhost2User, ?OK).
 
 vhost_limit_set_test(Config) ->
@@ -4040,7 +4125,17 @@ user_limits_list_test(Config) ->
     },
     rabbit_ct_broker_helpers:set_user_limits(Config, 0, NoVhostUser, maps:get(value, Limits4)),
 
-    ?assertEqual([Limits4], http_get(Config, "/user-limits/no_vhost_user", ?OK)).
+    ?assertEqual([Limits4], http_get(Config, "/user-limits/no_vhost_user", ?OK)),
+
+    %% A management-only user must not be able to enumerate other users' limits.
+    %% Reading own limits is allowed; reading another user's limits or the full
+    %% list must be refused.
+    http_get(Config, "/user-limits", User1, User1, ?NOT_AUTHORISED),
+    http_get(Config, "/user-limits", User2, User2, ?NOT_AUTHORISED),
+    http_get(Config, "/user-limits/" ++ binary_to_list(User1), User1, User1, ?OK),
+    http_get(Config, "/user-limits/" ++ binary_to_list(User2), User1, User1, ?NOT_AUTHORISED),
+    http_get(Config, "/user-limits/" ++ binary_to_list(User2), User2, User2, ?OK),
+    http_get(Config, "/user-limits/" ++ binary_to_list(User1), User2, User2, ?NOT_AUTHORISED).
 
 user_limit_set_test(Config) ->
     ?assertEqual([], http_get(Config, "/user-limits", ?OK)),
@@ -4100,15 +4195,8 @@ user_limit_set_test(Config) ->
     rabbit_ct_broker_helpers:set_user_tags(Config, 0, Vhost1User, [management]),
     rabbit_ct_broker_helpers:set_full_permissions(Config, Vhost1User, Vhost1),
 
-    Limits3 = [
-        #{
-            user => User1,
-            value => #{
-                'max-connections' => 1000,
-                'max-channels'    => 100
-            }
-        }],
-    ?assertEqual(Limits3, http_get(Config, "/user-limits/limit_test_user_1", Vhost1User, Vhost1User, ?OK)),
+    %% A management user cannot read another user's limits.
+    http_get(Config, "/user-limits/limit_test_user_1", Vhost1User, Vhost1User, ?NOT_AUTHORISED),
 
     %% Clear a limit
     http_delete(Config, "/user-limits/limit_test_user_1/max-connections", ?NO_CONTENT),
@@ -4331,7 +4419,7 @@ qq_status_vhost_authorisation_test(Config) ->
     rabbit_ct_broker_helpers:add_user(Config, User, User),
     rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
     http_get(Config, "/queues/quorum/qq-status-vh/qq_status_auth/status",
-             User, User, ?NOT_AUTHORISED),
+             User, User, ?NOT_FOUND),
     %% Permissions granted, must succeed.
     rabbit_ct_broker_helpers:set_full_permissions(Config, User, Vhost),
     http_get(Config, "/queues/quorum/qq-status-vh/qq_status_auth/status",

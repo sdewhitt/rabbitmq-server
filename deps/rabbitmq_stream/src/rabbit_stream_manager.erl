@@ -16,8 +16,6 @@
 
 -module(rabbit_stream_manager).
 
--feature(maybe_expr, enable).
-
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit/include/amqqueue.hrl").
@@ -29,6 +27,7 @@
          delete/3,
          create_super_stream/6,
          delete_super_stream/3,
+         delete_super_stream/4,
          lookup_leader/2,
          lookup_local_member/2,
          lookup_member/2,
@@ -169,33 +168,39 @@ create_super_stream(VirtualHost,
 delete_super_stream(VirtualHost, SuperStream, Username) ->
     case super_stream_partitions(VirtualHost, SuperStream) of
         {ok, Partitions} ->
-            case delete_super_stream_exchange(VirtualHost, SuperStream,
-                                              Username)
-            of
-                ok ->
-                    ok;
-                {error, Error} ->
-                    ?LOG_WARNING("Error while deleting super stream exchange ~tp, "
-                                       "~tp",
-                                       [SuperStream, Error]),
-                    ok
-            end,
-            [begin
-                 case delete(VirtualHost, Stream, Username) of
-                     {ok, deleted} ->
-                         ok;
-                     {error, Err} ->
-                         ?LOG_WARNING("Error while delete partition ~tp of super stream "
-                                            "~tp, ~tp",
-                                            [Stream, SuperStream, Err]),
-                         ok
-                 end
-             end
-             || Stream <- Partitions],
-            ok;
+            delete_super_stream(VirtualHost, SuperStream, Partitions, Username);
         {error, Error} ->
             {error, Error}
     end.
+
+%% Deletes a super stream using a caller-supplied, already authorization-checked
+%% partition list. Using the caller's snapshot closes the TOCTOU window that
+%% exists when the manager re-reads bindings after the authorization check.
+-spec delete_super_stream(binary(), binary(), [binary()], binary()) ->
+    ok.
+delete_super_stream(VirtualHost, SuperStream, Partitions, Username) ->
+    case delete_super_stream_exchange(VirtualHost, SuperStream, Username) of
+        ok ->
+            ok;
+        {error, Error} ->
+            ?LOG_WARNING("Error while deleting super stream exchange ~tp, "
+                         "~tp",
+                         [SuperStream, Error]),
+            ok
+    end,
+    [begin
+         case delete(VirtualHost, Stream, Username) of
+             {ok, deleted} ->
+                 ok;
+             {error, Err} ->
+                 ?LOG_WARNING("Error while delete partition ~tp of super stream "
+                              "~tp, ~tp",
+                              [Stream, SuperStream, Err]),
+                 ok
+         end
+     end
+     || Stream <- Partitions],
+    ok.
 
 -spec lookup_leader(binary(), binary()) ->
     {ok, pid()} | {error, not_available} |
@@ -626,6 +631,7 @@ validate_super_stream_creation(_VirtualHost, _Name, Partitions, BindingKeys)
 validate_super_stream_creation(VirtualHost, Name, Partitions, _BindingKeys) ->
     maybe
         ok ?= validate_super_stream_partitions(Partitions),
+        ok ?= validate_super_stream_max_partitions(Partitions),
         ok ?= case rabbit_vhost_limit:would_exceed_queue_limit(length(Partitions), VirtualHost) of
                   false ->
                       ok;
@@ -670,6 +676,17 @@ validate_super_stream_partitions(Partitions) ->
         _ -> {error, {validation_failed,
                       {rabbit_misc:format("Duplicate partition names found ~ts",
                                           [Partitions])}}}
+    end.
+
+validate_super_stream_max_partitions(Partitions) ->
+    case rabbit_stream_utils:validate_super_stream_max_partitions(Partitions) of
+        true ->
+            ok;
+        false ->
+            MaxPartitions = rabbit_stream_utils:max_super_stream_partitions(),
+            {error, {validation_failed,
+                     {rabbit_misc:format("The partition number must not exceed ~w",
+                                         [MaxPartitions])}}}
     end.
 
 exchange_exists(VirtualHost, Name) ->

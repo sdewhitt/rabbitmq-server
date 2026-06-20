@@ -210,7 +210,7 @@ matches(Q, Policy, Function) when ?is_amqqueue(Q) ->
     #resource{name = Name, virtual_host = VHost} = amqqueue:get_name(Q),
     matches_queue_type(queue, amqqueue:get_type(Q), pget('apply-to', Policy)) andalso
         is_applicable(Q, pget(definition, Policy), Function) andalso
-        match =:= re:run(Name, pget(pattern, Policy), [{capture, none}]) andalso
+        match =:= rabbit_re:run(Name, pget(pattern, Policy)) andalso
         VHost =:= pget(vhost, Policy);
 matches(#resource{kind = queue} = Resource, Policy, Function) ->
     {ok, Q} = rabbit_amqqueue:lookup(Resource),
@@ -218,7 +218,7 @@ matches(#resource{kind = queue} = Resource, Policy, Function) ->
 matches(#resource{name = Name, kind = Kind, virtual_host = VHost} = Resource, Policy, Function) ->
     matches_type(Kind, pget('apply-to', Policy)) andalso
         is_applicable(Resource, pget(definition, Policy), Function) andalso
-        match =:= re:run(Name, pget(pattern, Policy), [{capture, none}]) andalso
+        match =:= rabbit_re:run(Name, pget(pattern, Policy)) andalso
         VHost =:= pget(vhost, Policy).
 
 get0(_Name, undefined, undefined) -> undefined;
@@ -403,15 +403,18 @@ notify_clear(VHost, <<"operator_policy">>, Name, ActingUser) ->
 %% deleted; in which case it's fine to do nothing.
 update_matched_objects(VHost, PolicyDef, ActingUser) ->
     {XUpdateResults, QUpdateResults} =
-        case catch {list(VHost), list_op(VHost)} of
-            {'EXIT', {throw, {error, {no_such_vhost, _}}}} ->
-                {[], []}; %% [2]
-            {'EXIT', Exit} ->
-                exit(Exit);
+        try {list(VHost), list_op(VHost)} of
             {Policies, OpPolicies} ->
                 rabbit_db_policy:update(VHost,
                                         get_updated_exchange(Policies, OpPolicies),
                                         get_updated_queue(Policies, OpPolicies))
+        catch
+            throw:{error, {no_such_vhost, _}} ->
+                {[], []}; %% [2]
+            exit:Exit ->
+                exit(Exit);
+            error:ErrReason:ErrStack ->
+                exit({ErrReason, ErrStack})
         end,
     lists:foreach(
       fun(XRes) ->

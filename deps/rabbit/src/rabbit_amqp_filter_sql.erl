@@ -5,7 +5,6 @@
 %% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 
 -module(rabbit_amqp_filter_sql).
--feature(maybe_expr, enable).
 
 -include_lib("amqp10_common/include/amqp10_filter.hrl").
 -include_lib("kernel/include/logger.hrl").
@@ -255,16 +254,12 @@ like(Subject,{{prefix, PrefixSize, _} = Prefix,
     like(Subject, Suffix);
 like(Subject, CompiledRe)
   when element(1, CompiledRe) =:= re_pattern ->
-    try re:run(Subject, CompiledRe, [{capture, none},
-                                     {match_limit, 50_000},
-                                     {match_limit_recursion, 50_000}]) of
-        match ->
-            true;
-        _ ->
-            false
-    catch error:badarg ->
-              %% This branch is hit if Subject is not a UTF-8 string.
-              undefined
+    case rabbit_re:run(Subject, CompiledRe) of
+        match           -> true;
+        nomatch         -> false;
+        %% Subject is not a UTF-8 string.
+        {error, badarg} -> undefined;
+        {error, _}      -> false
     end.
 
 get_field_value(priority, Msg) ->
