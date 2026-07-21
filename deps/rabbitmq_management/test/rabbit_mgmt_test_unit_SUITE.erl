@@ -13,7 +13,8 @@
 
 all() ->
     [
-     {group, parallel_tests}
+     {group, parallel_tests},
+     {group, sequential_tests}
     ].
 
 groups() ->
@@ -23,8 +24,16 @@ groups() ->
                                    pack_binding_test,
                                    default_restrictions,
                                    path_prefix_test,
-                                   regex_dos_test
-                                  ]}
+                                   regex_dos_test,
+                                   has_json_extension_test
+                                  ]},
+     {sequential_tests, [], [
+                              referrer_policy_header_set_when_configured,
+                              referrer_policy_header_absent_when_not_configured,
+                              allow_header_absent_on_non_405_when_hide_configured,
+                              allow_header_present_on_405_when_hide_configured,
+                              allow_header_present_on_200_when_not_configured
+                             ]}
     ].
 
 %% -------------------------------------------------------------------
@@ -112,6 +121,50 @@ regex_dos_test(_) ->
     ?assertEqual(false, rabbit_mgmt_util:maybe_filter_by_keyword(
         name, EvilRegex, [{name, TargetString}], "true")).
 
+has_json_extension_test(_Config) ->
+    %% Standard .json extension
+    ?assert(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.json">>)),
+    %% Case-insensitive
+    ?assert(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.JSON">>)),
+    ?assert(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.Json">>)),
+    %% Non-json extensions are rejected
+    ?assertNot(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions.txt">>)),
+    ?assertNot(rabbit_mgmt_wm_definitions:has_json_extension(<<"definitions">>)),
+    %% The atom 'unknown' (no filename provided) is rejected
+    ?assertNot(rabbit_mgmt_wm_definitions:has_json_extension(unknown)).
+
+referrer_policy_header_set_when_configured(_Config) ->
+    application:set_env(rabbitmq_management, headers,
+                        [{referrer_policy, "no-referrer"}]),
+    Req = rabbit_mgmt_headers:set_common_permission_headers(fake_req(), ?MODULE),
+    RespHeaders = maps:get(resp_headers, Req),
+    ?assertEqual(<<"no-referrer">>, maps:get(<<"referrer-policy">>, RespHeaders)).
+
+referrer_policy_header_absent_when_not_configured(_Config) ->
+    Req = rabbit_mgmt_headers:set_common_permission_headers(fake_req(), ?MODULE),
+    RespHeaders = maps:get(resp_headers, Req),
+    ?assertNot(maps:is_key(<<"referrer-policy">>, RespHeaders)).
+
+allow_header_absent_on_non_405_when_hide_configured(_Config) ->
+    application:set_env(rabbitmq_management, hide_http_allow_header, true),
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>,
+                <<"content-type">> => <<"application/json">>},
+    Result = rabbit_cowboy_stream_h:maybe_strip_allow_header(200, Headers),
+    ?assertNot(maps:is_key(<<"allow">>, Result)),
+    ?assert(maps:is_key(<<"content-type">>, Result)).
+
+allow_header_present_on_405_when_hide_configured(_Config) ->
+    application:set_env(rabbitmq_management, hide_http_allow_header, true),
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>},
+    Result = rabbit_cowboy_stream_h:maybe_strip_allow_header(405, Headers),
+    ?assert(maps:is_key(<<"allow">>, Result)).
+
+allow_header_present_on_200_when_not_configured(_Config) ->
+    application:unset_env(rabbitmq_management, hide_http_allow_header),
+    Headers = #{<<"allow">> => <<"GET, HEAD, PUT, DELETE, OPTIONS">>},
+    Result = rabbit_cowboy_stream_h:maybe_strip_allow_header(200, Headers),
+    ?assert(maps:is_key(<<"allow">>, Result)).
+
 %%--------------------------------------------------------------------
 
 assert_binding(Packed, Routing, Args) ->
@@ -121,3 +174,12 @@ assert_binding(Packed, Routing, Args) ->
         Act ->
             throw({pack, Routing, Args, expected, Packed, got, Act})
     end.
+
+fake_req() ->
+    #{
+        resp_headers => #{},
+        headers      => #{},
+        method       => <<"GET">>,
+        scheme       => <<"http">>,
+        port         => 15672
+    }.

@@ -19,6 +19,13 @@
          handle_down/2,
          handle_queue_event/2]).
 
+-ifdef(TEST).
+-export([check_dead_letter_exchange_access/4,
+         check_subscription_binding_access/5,
+         ensure_exchange_exists/3,
+         check_user_id/2]).
+-endif.
+
 -include_lib("kernel/include/logger.hrl").
 -include("rabbit_stomp_frame.hrl").
 -include("rabbit_stomp.hrl").
@@ -946,6 +953,7 @@ do_send(Destination, _DestHdr,
                          },
 
             {ok, Message0} = mc_amqpl:message(ExchangeName, RoutingKey, Content0),
+            check_user_id(Message0, User),
             MsgIcptCtx = State2#state.cfg#cfg.msg_interceptor_ctx,
             Message = rabbit_msg_interceptor:intercept_incoming(Message0, MsgIcptCtx),
 
@@ -1645,10 +1653,14 @@ ensure_binding(#resource{name = QueueBin}, {<<>>, QueueBin}, _State) ->
     %% i.e., we should only be asked to bind to the default exchange a
     %% queue with its own name
     ok;
-ensure_binding(QName, {Exchange, RoutingKey}, _State = #state{cfg = #cfg{
-                                                                       auth_login = Username,
-                                                                       vhost = VHost}}) ->
-    Binding = #binding{source = rabbit_misc:r(VHost, exchange, Exchange),
+ensure_binding(QName, {Exchange, RoutingKey},
+               #state{user = User,
+                      authz_ctx = AuthzCtx,
+                      cfg = #cfg{auth_login = Username, vhost = VHost}}) ->
+    ExchangeName = rabbit_misc:r(VHost, exchange, Exchange),
+    ok = check_subscription_binding_access(QName, ExchangeName, RoutingKey,
+                                           User, AuthzCtx),
+    Binding = #binding{source = ExchangeName,
                        destination = QName,
                        key = RoutingKey},
     case rabbit_binding:add(Binding, Username) of
@@ -1662,6 +1674,38 @@ ensure_binding(QName, {Exchange, RoutingKey}, _State = #state{cfg = #cfg{
             rabbit_misc:protocol_error(Error);
         ok ->
             ok
+    end.
+
+%% Binding creation requires the same authorisation as `queue.bind`.
+-spec check_subscription_binding_access(rabbit_amqqueue:name(),
+                                        rabbit_types:exchange_name(),
+                                        rabbit_types:routing_key(),
+                                        rabbit_types:user(),
+                                        rabbit_types:authz_context()) -> ok.
+check_subscription_binding_access(QName, ExchangeName, RoutingKey, User, AuthzCtx) ->
+    ok = check_resource_access(User, QName, write, AuthzCtx),
+    ok = check_resource_access(User, ExchangeName, read, AuthzCtx),
+    case rabbit_exchange:lookup(ExchangeName) of
+        {ok, Exchange} ->
+            _ = check_topic_authorisation(Exchange, User, RoutingKey, AuthzCtx, read),
+            ok;
+        {error, not_found} ->
+            ok
+    end.
+
+check_dead_letter_exchange_access(QName = #resource{virtual_host = VHost},
+                                  Args, User, AuthzCtx) ->
+    case rabbit_misc:r_arg(VHost, exchange, Args, ?HEADER_X_DEAD_LETTER_EXCHANGE) of
+        undefined ->
+            ok;
+        {error, {invalid_type, Type}} ->
+            rabbit_misc:protocol_error(
+              precondition_failed,
+              "invalid type '~ts' for arg '~ts'",
+              [Type, ?HEADER_X_DEAD_LETTER_EXCHANGE]);
+        DLX ->
+            ok = check_resource_access(User, QName, read, AuthzCtx),
+            ok = check_resource_access(User, DLX, write, AuthzCtx)
     end.
 
 check_resource_access(User, Resource, Perm, Context) ->
@@ -1796,8 +1840,7 @@ parse_endpoint0(Type,     Rest) ->
 %% --------------------------------------------------------------------------
 
 util_ensure_endpoint(source, {exchange, {Name, _}}, Params, State = #state{cfg = #cfg{vhost = VHost}}) ->
-    ExchangeName = rabbit_misc:r(Name, exchange, VHost),
-    check_exchange(ExchangeName, proplists:get_value(check_exchange, Params, false)),
+    ensure_exchange_exists(VHost, Name, Params),
     Amqqueue = new_amqqueue(undefined, exchange, Params, State),
     {ok, Queue} = create_queue(Amqqueue, State),
     {ok, amqqueue:get_name(Queue), State};
@@ -1824,8 +1867,7 @@ util_ensure_endpoint(_, {queue, Name}, Params, State=#state{route_state = Routin
     {ok,  rabbit_misc:r(VHost, queue, QueueNameBin), State#state{route_state = RState1}};
 
 util_ensure_endpoint(dest, {exchange, {Name, _}}, Params, State = #state{cfg = #cfg{vhost = VHost}}) ->
-    ExchangeName = rabbit_misc:r(Name, exchange, VHost),
-    check_exchange(ExchangeName, proplists:get_value(check_exchange, Params, false)),
+    ensure_exchange_exists(VHost, Name, Params),
     {ok, undefined, State};
 
 util_ensure_endpoint(dest, {topic, _}, _Params, State) ->
@@ -1857,6 +1899,10 @@ dest_temp_queue({temp_queue, Name}) -> Name;
 dest_temp_queue(_)                  -> none.
 
 %% --------------------------------------------------------------------------
+
+ensure_exchange_exists(VHost, Name, Params) ->
+    ExchangeName = rabbit_misc:r(VHost, exchange, Name),
+    check_exchange(ExchangeName, proplists:get_value(check_exchange, Params, false)).
 
 check_exchange(_,            false) ->
     ok;
@@ -1939,6 +1985,8 @@ create_queue(Amqqueue, _State = #state{authz_ctx = AuthzCtx,
 
     %% configure access to queue required for queue.declare
     ok = check_resource_access(User, QName, configure, AuthzCtx),
+    ok = check_dead_letter_exchange_access(
+           QName, amqqueue:get_arguments(Amqqueue), User, AuthzCtx),
 
     case rabbit_vhost_limit:is_over_queue_limit(VHost) of
         false ->
@@ -1971,6 +2019,15 @@ check_internal_exchange(#exchange{name = Name, internal = true}) ->
 check_internal_exchange(_) ->
     ok.
 
+%% Applies the same user_id property check that the AMQP 0-9-1 and AMQP 1.0
+%% publish paths already apply.
+check_user_id(Message, User) ->
+    case rabbit_access_control:check_user_id(Message, User) of
+        ok ->
+            ok;
+        {refused, Reason, Args} ->
+            rabbit_misc:protocol_error(access_refused, Reason, Args)
+    end.
 
 check_topic_authorisation(#exchange{name = Name = #resource{virtual_host = VHost}, type = topic},
                           User = #user{username = Username},

@@ -1,9 +1,30 @@
 
-$(document).ready(function() {    
+const API_ERROR_REASONS = {
+    'failed_to_parse_json':       'Definitions file could not be parsed. Make sure it is valid JSON.',
+    'unsupported_file_extension': '{filename}Only .json files are accepted for definitions import.',
+};
+
+function format_error_response(response, reason) {
+    var template = API_ERROR_REASONS[reason];
+    if (typeof(template) != 'string') {
+        return reason;
+    }
+    return template.replace(/\{(\w+)\}/g, function(_, key) {
+        var val = response[key];
+        return val !== undefined ? val + ': ' : '';
+    });
+}
+
+$(document).ready(function() {
+  setup_oauth_events_if_required();
   var url_string = window.location.href;
   var url = new URL(url_string);
   var error = url.searchParams.get('error');
   if (error) {
+    // A failed IDP-initiated login returns here with an error. Drop the
+    // pending state markers to avoid a confusing redirect the next successful login.
+    clear_pref("oauth-idp-pending");
+    clear_pref("oauth-return-to");
     if (oauth.enabled) {
       renderWarningMessageInLoginStatus(oauth, fmt_escape_html(error));
     }
@@ -32,8 +53,6 @@ function removeDuplicates(array){
 
 
 function startWithOAuthLogin (oauth) {
-  store_pref("oauth-return-to", window.location.hash);
-
   if (!oauth.logged_in) {
     hasAnyResourceServerReady(oauth, (oauth, warnings) => {  render_login_oauth(oauth, warnings); start_app_login(); })
   } else {
@@ -91,7 +110,7 @@ function start_app_login () {
       });
     }
   })
-  
+
   if (oauth.enabled) {
     if (has_auth_credentials()) {
       check_login();
@@ -176,14 +195,22 @@ function start_app() {
     var url = this.location.toString();
     var hash = this.location.hash;
     var pathname = this.location.pathname;
+
+    var return_to = '#/';
+    if (get_pref("oauth-idp-pending")) {
+        clear_pref("oauth-idp-pending");
+        return_to = get_pref("oauth-return-to") || '#/';
+        clear_pref("oauth-return-to");
+    }
+
     if (url.indexOf('#') == -1) {
-        this.location = url + '#/';
+        this.location = url + return_to;
     } else if (hash.indexOf('#token_type') != - 1 && pathname == '/') {
         // This is equivalent to previous `if` clause when uaa authorisation is used.
         // Tokens are passed in the url hash, so the url always contains a #.
         // We need to check the current path is `/` and token is present,
         // so we can redirect to `/#/`
-        this.location = url.replace(/#token_type.+/gi, '#/');
+        this.location = url.replace(/#token_type.+/gi, return_to);
     }
 
     app = new Sammy.Application(dispatcher);
@@ -211,6 +238,32 @@ function setup_constant_events() {
     if (!vhosts_interesting) {
         $('#vhost-form').hide();
     }
+    setup_form_events();
+}
+
+function setup_form_events() {
+    $(document).on('click', '#ff-enable-all-button', function() {
+        enable_all_stable_feature_flags(this);
+    });
+    $(document).on('change', '[data-flag-name]', function() {
+        handle_feature_flag(this, $(this).data('flagName'));
+    });
+}
+
+function setup_oauth_events_if_required() {
+    if (!oauth.enabled) {
+        return;
+    }
+    $(document).on('click', '[data-oauth-action="login"]', function() {
+        oauth_initiateLogin($(this).data('resourceId'));
+    });
+    $(document).on('click', '[data-oauth-action="logout"]', function() {
+        oauth_initiateLogout();
+    });
+    $(document).on('submit', '#oauth2-resource-form', function(e) {
+        e.preventDefault();
+        oauth_initiateLogin(document.getElementById('oauth2-resource').value);
+    });
 }
 
 function update_vhosts() {
@@ -345,7 +398,7 @@ function go_to_home() {
     // location.href = rabbit_path_prefix() + "/"
     location.href =  "/"
   }
-  
+
 function set_timer_interval(interval) {
     timer_interval = interval;
     reset_timer();
@@ -867,6 +920,15 @@ function postprocess() {
         }
     });
 
+    $('select[name="queuetype"]').on('change', function() {
+        select_queue_type(this);
+    });
+
+    $('[name="upload-definitions"]').on('click', function(e) {
+        e.preventDefault();
+        submit_import($(this).closest('form')[0]);
+    });
+
     $(document).on('click', '.help', function() {
       show_popup('help', HELP[$(this).attr('id')]);
     });
@@ -1090,6 +1152,8 @@ function postprocess_partial() {
     else {
         $('#filter-truncate').removeClass('filter-warning');
     }
+
+    feature_flags_refresh();
 }
 
 function update_multifields() {
@@ -1360,17 +1424,11 @@ function replace_content(id, html) {
     $("#" + id).html(html);
 }
 
-var ejs_cached = {};
-
 function format(template, json) {
     try {
-        var cache = true;
-        if (!(template in ejs_cached)) {
-            ejs_cached[template] = true;
-            cache = false;
-        }
-        var tmpl = new EJS({url: 'js/tmpl/' + template + '.ejs', cache: cache});
-        return tmpl.render(json);
+        var fn = COMPILED_TEMPLATES[template];
+        if (!fn) throw new Error('Template not found: ' + template);
+        return fn.call(json, json, json);
     } catch (err) {
         clearInterval(timer);
         console.log("Uncaught error: " + err);
@@ -1431,7 +1489,7 @@ function with_req(method, path, body, fun, on404fun) {
             if (check_bad_response(req, !on404fun, on404fun)) {
                 last_successful_connect = new Date();
                 fun(req);
-            } 
+            }
         }
     };
     outstanding_reqs.push(req);
@@ -1522,7 +1580,7 @@ function initiate_logout(oauth, error = "") {
 }
 /**
  * Handle bad http response
- * @param {*} req 
+ * @param {*} req
  * @param {*} full_page_404 In case of 404, reload entire html page with the error message
  * @param {*} on404fun In case of 404, call this function or else show a popup error message
  * @returns true if there was no bad response
@@ -1550,17 +1608,17 @@ function check_bad_response(req, full_page_404, on404fun) {
         if (typeof(reason) != 'string') {
             reason = JSON.stringify(reason);
         }
-        if (    error == 'bad_request' || 
-                error == 'not_found'  || 
-                reason == 'Not Found' || 
-                error == 'not_authorised' || 
+        if (    error == 'bad_request' ||
+                error == 'not_found'  ||
+                reason == 'Not Found' ||
+                error == 'not_authorised' ||
                 error == 'not_authorized') {
             if ((req.status == 401 || req.status == 403) && oauth.enabled) {
                 initiate_logout(oauth, reason);
             } else if (on404fun && (typeof on404fun === 'function') && req.status == 404) {
                 on404fun(response);
             } else {
-                show_popup('warn', fmt_escape_html(reason));
+                show_popup('warn', fmt_escape_html(format_error_response(response, reason)));
             }
         } else if (error == 'page_out_of_range') {
             var seconds = 60;
@@ -1684,12 +1742,15 @@ function collapse_multifields(params0) {
         }
     }
     if (params.hasOwnProperty('queuetype')) {
+        var the_queue_type = params['queuetype'];
         delete params['queuetype'];
-        if (queue_type != 'default') {
-            params['arguments']['x-queue-type'] = queue_type;
+        if (the_queue_type != 'default') {
+            if (params['arguments'] == undefined) {
+                params['arguments'] = {};
+            }
+            params['arguments']['x-queue-type'] = the_queue_type;
         }
-
-        params = Object.assign(params, QUEUE_TYPE[queue_type].params)
+        params = Object.assign(params, QUEUE_TYPE[the_queue_type].params)
     }
     return params;
 }
@@ -1870,7 +1931,7 @@ function is_internal(queue) {
     return queue.internal;
 }
 
-function get_queue_type (queue) {    
+function get_queue_type (queue) {
     switch(queue.type) {
         case "classic":
         case "quorum":

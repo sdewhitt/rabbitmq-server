@@ -12,7 +12,7 @@ define PROJECT_ENV
 
 	    {cors_allow_origins, []},
 	    {cors_max_age, 1800},
-	    {content_security_policy, "script-src 'self' 'unsafe-eval' 'unsafe-inline'; object-src 'self'"},
+	    {content_security_policy, "script-src 'self'; object-src 'self'"},
 	    {max_http_body_size, 10000000},
 	    {delegate_count, 5},
 	    {require_auth_for_api_reference, false}
@@ -25,7 +25,7 @@ endef
 
 DEPS = rabbit_common rabbit amqp_client cowboy cowlib rabbitmq_web_dispatch rabbitmq_management_agent oauth2_client
 TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers proper rabbitmq_amqp_client
-LOCAL_DEPS += ranch ssl crypto public_key
+LOCAL_DEPS += ranch ssl crypto public_key inets
 
 # FIXME: Add Ranch as a BUILD_DEPS to be sure the correct version is picked.
 # See rabbitmq-components.mk.
@@ -33,7 +33,14 @@ BUILD_DEPS += ranch
 
 CT_HOOKS = rabbit_ct_hook
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
-DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
+DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk \
+              rabbitmq_management/mk/rabbitmq-management-plugin.mk
+
+# This plugin provides the EJS build scripts, so use paths relative to this
+# directory rather than the default $(DEPS_DIR)/rabbitmq_management/... which
+# would be a self-referential path when building this plugin standalone.
+EJS_COMPILE = scripts/precompile_ejs_templates
+EJS_VERIFY  = scripts/verify_ejs_templates.js
 
 include ../../rabbitmq-components.mk
 include ../../erlang.mk

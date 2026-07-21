@@ -147,7 +147,9 @@ update_state(AuthUser, NewToken) ->
                         ok ->
                             Tags = tags_from(DecodedToken),
                             Token1 = DecodedToken#{<<"x-rmq-scope-pattern-syntax">> =>
-                                                   ResourceServer#resource_server.scope_pattern_syntax},
+                                                   ResourceServer#resource_server.scope_pattern_syntax,
+                                                   <<"x-rmq-require-exp">> =>
+                                                   ResourceServer#resource_server.require_exp},
                             {ok, AuthUser#auth_user{tags = Tags,
                                                     impl = fun() -> Token1 end}};
                         {error, mismatch_username_after_token_refresh} ->
@@ -186,7 +188,9 @@ authenticate(_, AuthProps0) ->
                 {refused, Err} ->
                     {refused, "Authentication using an OAuth 2/JWT token failed: ~tp", [Err]};
                 {ok, DecodedToken} ->
-                    case with_decoded_token(DecodedToken, fun(In) -> auth_user_from_token(In, ResourceServer) end) of
+                    DecodedToken1 = DecodedToken#{<<"x-rmq-require-exp">> =>
+                        ResourceServer#resource_server.require_exp},
+                    case with_decoded_token(DecodedToken1, fun(In) -> auth_user_from_token(In, ResourceServer) end) of
                         {error, Err} ->
                             {refused, "Authentication using an OAuth 2/JWT token failed: ~tp", [Err]};
                         Else ->
@@ -234,7 +238,6 @@ ensure_same_username(PreferredUsernameClaims, CurrentDecodedToken, NewDecodedTok
         {CurUsername, CurUsername} -> ok;
         _ -> {error, mismatch_username_after_token_refresh}
     end.
-
 validate_token_expiry(#{<<"exp">> := Exp}) when is_number(Exp) ->
     Now = os:system_time(seconds),
     ExpTs = trunc(Exp),
@@ -244,7 +247,11 @@ validate_token_expiry(#{<<"exp">> := Exp}) when is_number(Exp) ->
     end;
 validate_token_expiry(#{<<"exp">> := _}) ->
     {error, "Provided JWT token has an invalid exp claim: value is not a number"};
-validate_token_expiry(#{}) -> ok.
+validate_token_expiry(Token) ->
+    case maps:get(<<"x-rmq-require-exp">>, Token, true) of
+        true  -> {error, "Provided JWT token has no exp claim"};
+        false -> ok
+    end.
 
 -spec check_token(raw_jwt_token(), {resource_server(), internal_oauth_provider()}) ->
           {'ok', decoded_jwt_token()} |
@@ -264,7 +271,6 @@ check_token(Token, {ResourceServer, InternalOAuthProvider}) ->
             end;
         {false, _} -> {refused, signature_invalid}
     end.
-
 extract_scopes_from_scope_claim(Payload) -> 
     case maps:find(?SCOPE_JWT_FIELD, Payload) of
         {ok, Bin} when is_binary(Bin) -> 
@@ -347,6 +353,9 @@ extract_scopes_using_scope_aliases(_, Payload) -> Payload.
 extract_token_value(R, Payload, Path, ValueMapperFun) 
         when is_map(Payload), is_binary(Path), is_function(ValueMapperFun) ->
     extract_token_value_from_map(R, Payload, [], split_path(Path), ValueMapperFun);
+extract_token_value(R, Payload, Path, ValueMapperFun)
+        when is_map(Payload), is_list(Path), is_function(ValueMapperFun) ->
+    extract_token_value_from_map(R, Payload, [], Path, ValueMapperFun);
 extract_token_value(_, _, _, _) ->
     [].
 
@@ -413,6 +422,17 @@ extract_scopes_from_additional_scopes_key(
     Paths = binary:split(Key, <<" ">>, [global, trim_all]),
     AdditionalScopes = [ extract_token_value(ResourceServer, 
         Payload, Path, fun extract_scope_list_from_token_value/2) || Path <- Paths],    
+    set_scope(lists:flatten(AdditionalScopes) ++ get_scope(Payload), Payload);
+%% Paths is expected to be a list of pre-tokenized paths, each itself a list of
+%% segment binaries, e.g. [[<<"realm">>, <<"roles">>]]. This is the shape produced
+%% by rabbit_oauth2_schema:tokenize_additional_scopes_key/1 from rabbitmq.conf.
+%% A single-level list of binaries is treated as several top-level paths, not one
+%% nested path.
+extract_scopes_from_additional_scopes_key(
+        #resource_server{additional_scopes_key = Paths} = ResourceServer, Payload)
+          when is_list(Paths) ->
+    AdditionalScopes = [ extract_token_value(ResourceServer,
+        Payload, Path, fun extract_scope_list_from_token_value/2) || Path <- Paths],
     set_scope(lists:flatten(AdditionalScopes) ++ get_scope(Payload), Payload);
 extract_scopes_from_additional_scopes_key(_, Payload) -> Payload.
 
@@ -522,12 +542,7 @@ resolve_scope_var(Elem, Token, Vhost, Syntax) ->
     end.
 
 escape_regex_metacharacters(Str) ->
-    %% Escapes "-" as well: inside a [...] character class it forms a range,
-    %% so a template like "[{var}]" with var="a-z" would otherwise match any
-    %% letter rather than the literal three-character value.
-    binary_to_list(
-        re:replace(Str, <<"[.^$|()\\[\\]{}*+?\\\\-]">>, <<"\\\\&">>,
-                   [global, {return, binary}, unicode])).
+    binary_to_list(rabbit_re:escape(iolist_to_binary(Str))).
 
 -spec tags_from(decoded_jwt_token()) -> list(atom()).
 tags_from(DecodedToken) ->

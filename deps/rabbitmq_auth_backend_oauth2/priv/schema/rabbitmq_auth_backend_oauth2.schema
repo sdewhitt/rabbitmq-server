@@ -60,6 +60,9 @@
 
 %% Configure the plugin to also look in other fields using additional_scopes_key (maps to extra_scopes_source in the old format)
 %%
+%% Use \. to address claim keys that contain literal dots, for example:
+%% auth_oauth2.additional_scopes_key = https://example\.com/claims.roles
+%%
 %% {additional_scopes_key, <<"my_custom_scope_key">>},
 
 {mapping,
@@ -70,7 +73,8 @@
 {translation,
  "rabbitmq_auth_backend_oauth2.extra_scopes_source",
  fun(Conf) ->
-    list_to_binary(cuttlefish:conf_get("auth_oauth2.additional_scopes_key", Conf))
+    rabbit_oauth2_schema:tokenize_additional_scopes_key(
+        cuttlefish:conf_get("auth_oauth2.additional_scopes_key", Conf))
  end}.
 
 {mapping,
@@ -101,6 +105,19 @@
 {mapping,
  "auth_oauth2.verify_aud",
  "rabbitmq_auth_backend_oauth2.verify_aud",
+ [{datatype, boolean}]}.
+
+%% Require the exp (expiration time) claim in JWT tokens. When true (the
+%% default), a token without an exp claim is rejected. RFC 7519 makes exp
+%% optional, but a token without it never expires, so a stolen or leaked token
+%% stays valid forever. Set to false only when your identity provider cannot
+%% issue tokens with an exp claim.
+%%
+%% {require_exp, true},
+
+{mapping,
+ "auth_oauth2.require_exp",
+ "rabbitmq_auth_backend_oauth2.require_exp",
  [{datatype, boolean}]}.
 
 %% How scope patterns match vhost names, resource names, and topic routing keys.
@@ -417,6 +434,16 @@
  "auth_oauth2.resource_servers.$name.scope_aliases.$index.scope",
  "rabbitmq_auth_backend_oauth2.resource_servers",
  [{datatype, string}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.verify_aud",
+ "rabbitmq_auth_backend_oauth2.verify_aud",
+ [{datatype, boolean}]}.
+
+{mapping,
+ "auth_oauth2.resource_servers.$name.require_exp",
+ "rabbitmq_auth_backend_oauth2.require_exp",
+ [{datatype, boolean}]}.
 
 {mapping,
   "auth_oauth2.resource_servers.$name.oauth_provider_id",

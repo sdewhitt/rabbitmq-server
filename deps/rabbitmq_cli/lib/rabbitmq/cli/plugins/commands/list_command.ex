@@ -7,7 +7,7 @@
 defmodule RabbitMQ.CLI.Plugins.Commands.ListCommand do
   import RabbitCommon.Records
 
-  alias RabbitMQ.CLI.Core.{Config, DocGuide, Validators}
+  alias RabbitMQ.CLI.Core.{DocGuide, Validators}
   alias RabbitMQ.CLI.Plugins.Helpers, as: PluginHelpers
   import RabbitMQ.CLI.Core.{CodePath, Paths}
 
@@ -37,14 +37,18 @@ defmodule RabbitMQ.CLI.Plugins.Commands.ListCommand do
   end
 
   def validate_execution_environment(args, opts) do
-    Validators.chain(
-      [
-        &require_rabbit_and_plugins/2,
-        &PluginHelpers.enabled_plugins_file/2,
-        &plugins_dir/2
-      ],
-      [args, opts]
-    )
+    if PluginHelpers.node_is_local?(opts) do
+      Validators.chain(
+        [
+          &require_rabbit_and_plugins/2,
+          &PluginHelpers.enabled_plugins_file/2,
+          &plugins_dir/2
+        ],
+        [args, opts]
+      )
+    else
+      :ok
+    end
   end
 
   def run([pattern], %{node: node_name} = opts) do
@@ -54,30 +58,23 @@ defmodule RabbitMQ.CLI.Plugins.Commands.ListCommand do
     all = PluginHelpers.list(opts)
     enabled = PluginHelpers.read_enabled(opts)
 
-    missing = MapSet.difference(MapSet.new(enabled), MapSet.new(PluginHelpers.plugin_names(all)))
-
-    case Enum.empty?(missing) do
-      true ->
-        :ok
-
-      false ->
-        case Config.output_less?(opts) do
-          false ->
-            names = Enum.join(Enum.to_list(missing), ", ")
-            IO.puts("WARNING - plugins currently enabled but missing: #{names}\n")
-
-          true ->
-            :ok
-        end
-    end
+    missing = PluginHelpers.missing_plugins(enabled, all)
+    PluginHelpers.warn_about_missing_plugins(missing, opts)
 
     implicit = :rabbit_plugins.dependencies(false, enabled, all)
     enabled_implicitly = implicit -- enabled
 
     {status, running} =
       case remote_running_plugins(node_name) do
-        :error -> {:node_down, []}
-        {:ok, active} -> {:running, active}
+        :error ->
+          if PluginHelpers.node_is_local?(opts) do
+            {:offline, []}
+          else
+            {:node_down, []}
+          end
+
+        {:ok, active} ->
+          {:running, active}
       end
 
     {:ok, re} = Regex.compile(pattern)

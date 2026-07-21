@@ -285,7 +285,7 @@ show-test-tls-certs-dir: $(TEST_TLS_CERTS_DIR)
 ifdef NOBUILD
 DIST_TARGET ?=
 else
-ifeq ($(wildcard ebin/test),)
+ifeq ($(wildcard $(ERLANG_MK_TMP)/$(PROJECT).test),)
 DIST_TARGET ?= dist
 else
 DIST_TARGET ?= test-dist
@@ -355,9 +355,10 @@ start-background-broker: node-tmpdir $(DIST_TARGET)
 	ERL_LIBS="$(DIST_ERL_LIBS)" \
 	  $(RABBITMQCTL) -n $(RABBITMQ_NODENAME) wait --timeout $(RMQCTL_WAIT_TIMEOUT) $(RABBITMQ_PID_FILE) && \
 	for i in $$(seq 1 10); do \
-	  ERL_LIBS="$(DIST_ERL_LIBS)" $(RABBITMQCTL) -n $(RABBITMQ_NODENAME) await_startup || sleep 1; \
-	done && \
-	ERL_LIBS="$(DIST_ERL_LIBS)" $(RABBITMQCTL) -n $(RABBITMQ_NODENAME) await_startup
+	  ERL_LIBS="$(DIST_ERL_LIBS)" $(RABBITMQCTL) -n $(RABBITMQ_NODENAME) await_startup && exit 0; \
+	  sleep 1; \
+	done; \
+	exit 1
 
 start-rabbit-on-node:
 	$(exec_verbose) ERL_LIBS="$(DIST_ERL_LIBS)" \

@@ -534,6 +534,37 @@
  },
 
  %%
+ %% Referrer-Policy
+ %%
+
+ {headers_referrer_policy_case1,
+  "management.headers.referrer_policy = no-referrer",
+  [
+   {rabbitmq_management, [
+                          {headers, [
+                            {referrer_policy, "no-referrer"}
+                          ]}
+                         ]}
+  ], [rabbitmq_management]
+ },
+
+ {csp_and_hsts_and_referrer_policy_combined,
+  "management.csp.policy = default-src 'self' *.mailsite.com; img-src *
+   management.hsts.policy = max-age=31536000; includeSubDomains
+   management.headers.referrer_policy = no-referrer",
+  [
+   {rabbitmq_management, [
+                          {content_security_policy, "default-src 'self' *.mailsite.com; img-src *"},
+                          {strict_transport_security, "max-age=31536000; includeSubDomains"},
+
+                          {headers, [
+                            {referrer_policy, "no-referrer"}
+                          ]}
+                         ]}
+  ], [rabbitmq_management]
+ },
+
+ %%
  %% Restrictions
  %%
 
@@ -559,6 +590,37 @@
                                     {disabled, true}
                                 ]}
                            ]}
+                          ]}
+   ], [rabbitmq_management]
+  },
+
+ %%
+ %% Hide Allow header
+ %%
+
+  {hide_allow_header,
+   "management.http.hide_allow_header = true",
+   [
+    {rabbitmq_management, [
+                           {hide_http_allow_header, true}
+                          ]}
+   ], [rabbitmq_management]
+  },
+
+  {require_definition_json_extension_disabled,
+   "management.definitions.require_json_extension = false",
+   [
+    {rabbitmq_management, [
+                           {require_definition_json_extension, false}
+                          ]}
+   ], [rabbitmq_management]
+  },
+
+  {require_definition_json_extension_enabled,
+   "management.definitions.require_json_extension = true",
+   [
+    {rabbitmq_management, [
+                           {require_definition_json_extension, true}
                           ]}
    ], [rabbitmq_management]
   },

@@ -130,9 +130,15 @@ defmodule ListPluginsCommandTest do
 
     %{
       plugins: actual_plugins
-    } = @command.run([".*"], Map.merge(context[:opts], %{node: :nonode}))
+    } = @command.run([".*"], Map.merge(context[:opts], %{node: :rabbit}))
 
     assert_plugin_states(actual_plugins, expected_plugins)
+  end
+
+  test "run: a call to an unreachable node returns node_down status with an empty plugin list",
+       context do
+    assert %{status: :node_down, plugins: []} =
+             @command.run([".*"], Map.merge(context[:opts], %{node: :jake@thedog}))
   end
 
   test "run: reports list of started plugins for started node", context do
@@ -450,7 +456,7 @@ defmodule ListPluginsCommandTest do
     opts =
       context[:opts]
       |> Map.put_new(:silent, true)
-      |> Map.put_new(:hard_write, true)
+      |> Map.put_new(:keep_missing_plugins, true)
 
     context = Map.replace(context, :opts, opts)
 
@@ -469,7 +475,7 @@ defmodule ListPluginsCommandTest do
       opts =
         context[:opts]
         |> Map.delete(:silent)
-        |> Map.delete(:hard_write)
+        |> Map.delete(:keep_missing_plugins)
 
       context = Map.replace(context, :opts, opts)
 
@@ -511,7 +517,7 @@ defmodule ListPluginsCommandTest do
     opts =
       context[:opts]
       |> Map.put_new(:quiet, true)
-      |> Map.put_new(:hard_write, true)
+      |> Map.put_new(:keep_missing_plugins, true)
 
     context = Map.replace(context, :opts, opts)
 
@@ -530,7 +536,7 @@ defmodule ListPluginsCommandTest do
       opts =
         context[:opts]
         |> Map.delete(:quiet)
-        |> Map.delete(:hard_write)
+        |> Map.delete(:keep_missing_plugins)
 
       context = Map.replace(context, :opts, opts)
 
